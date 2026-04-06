@@ -1,0 +1,29 @@
+Fold 4 Validation Metrics
+================================================================================
+Macro F1 Score: 0.67275
+Checkpoint Used: ./rag403/rag_encoder_fold4_best.pt
+
+Confusion Matrix:
+        pred_0  pred_1  pred_2  pred_3  pred_4  pred_5  pred_6
+true_0     113       0      10      22       1       0       0
+true_1       0      97       6       0       0       0       0
+true_2       7       4    3110      40       0       0       0
+true_3      23       0      53      94       8       0       0
+true_4      11       0       3      23      27       0       0
+true_5       1       0       0       2       0       1       0
+true_6       0       0       0       2       1       0       2
+
+Detailed Metrics:
+              precision    recall  f1-score   support
+
+           0    0.72903   0.77397   0.75083       146
+           1    0.96040   0.94175   0.95098       103
+           2    0.97737   0.98387   0.98061      3161
+           3    0.51366   0.52809   0.52078       178
+           4    0.72973   0.42188   0.53465        64
+           5    1.00000   0.25000   0.40000         4
+           6    1.00000   0.40000   0.57143         5
+
+    accuracy                        0.94073      3661
+   macro avg    0.84431   0.61422   0.67275      3661
+weighted avg    0.94017   0.94073   0.93926      3661
