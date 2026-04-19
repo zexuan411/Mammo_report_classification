@@ -33,10 +33,15 @@ def clean_text(s: str) -> str:
     if pd.isna(s):
         return ""
     s = str(s).strip().lower()
+    # s = str(s).strip()
     s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # s = re.sub(r"[?\\/]{1} ?", "", s)
+    # s = re.sub(r"([.,:;!?])\1+", r"\1", s)
+    # s = re.sub(r"[®]", "", s)
     s = _whitespace_re.sub(" ", s)
     s = _newlines_re.sub("\n", s)
     return s
+
 
 
 def stable_hash(s: str) -> str:
@@ -149,7 +154,7 @@ def make_encodings(tokenizer, texts, max_length):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, use_ordinal=False, use_amp=False, amp_dtype=torch.float16):
     model.eval()
     preds = []
     trues = []
@@ -159,8 +164,21 @@ def evaluate(model, loader, device):
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        pred = torch.argmax(outputs.logits, dim=-1)
+        with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            
+            if use_ordinal:
+                # For ordinal loss: sum of sigmoid predictions across binary classifiers
+                # If sum >= k, predict class k
+                ordinal_logits = outputs.logits[:, :-1]  # Use first K-1 outputs
+                ordinal_probs = torch.sigmoid(ordinal_logits)  # Convert to probabilities
+                # Count how many classifiers predict >= 0.5
+                pred = torch.sum(ordinal_probs >= 0.5, dim=1).long()
+                # Clip to valid range [0, num_classes-1]
+                pred = torch.clamp(pred, 0, outputs.logits.size(1) - 1)
+            else:
+                # Standard cross entropy: argmax
+                pred = torch.argmax(outputs.logits, dim=-1)
 
         preds.extend(pred.cpu().numpy().tolist())
         trues.extend(labels.cpu().numpy().tolist())
@@ -183,3 +201,43 @@ def save_classification_report_as_table(y_true, y_pred, id2label, save_path):
     report_df = pd.DataFrame(report_dict).transpose()
     report_df.to_csv(save_path)
 
+
+def compute_classification_loss(logits, labels, class_weights=None, use_focal_loss=False, focal_gamma=2.0):
+    """
+    Compute classification loss with optional focal loss.
+    
+    Args:
+        logits: Model output logits (batch_size, num_classes)
+        labels: Ground truth labels (batch_size,)
+        class_weights: Optional class weights tensor
+        use_focal_loss: Whether to apply focal loss
+        focal_gamma: Focal loss gamma parameter
+    """
+    # Standard cross entropy loss
+    ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction="none")
+    
+    if not use_focal_loss:
+        return ce_loss.mean()
+    
+    # Focal loss: down-weight easy examples, up-weight hard examples
+    # pt is the probability of the true class
+    pt = torch.exp(-ce_loss)
+    # focal weight: (1 - pt)^gamma
+    focal_weight = (1.0 - pt).pow(focal_gamma)
+    focal_loss = focal_weight * ce_loss
+    
+    return focal_loss.mean()
+
+
+def clean_and_isolate_text(s: str) -> str:
+    if pd.isna(s): return ""
+    s = str(s).strip().lower()
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{2,}", "\n", s)
+    match = re.search(r'achados:(.*?)(análise comparativa:|$)', s, flags=re.DOTALL)
+    if match: s = match.group(1).strip()
+    s = re.sub(r'\b(?:cm|mm)\b', ' \1 ', s)
+    s = re.sub(r'[0-9]+,[0-9]+', 'NUM', s)
+    s = re.sub(r'[0-9]+', 'NUM', s)
+    return s
