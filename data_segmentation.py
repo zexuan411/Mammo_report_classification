@@ -139,9 +139,13 @@ class TokenLevelSegmentedBert(nn.Module):
 
         #  动态段落权重（gating）
         self.segment_gate = nn.Linear(proj_size, 1)
+        nn.init.xavier_uniform_(self.segment_gate.weight)
+        nn.init.zeros_(self.segment_gate.bias)
 
         # --- Global CLS ---
-        self.global_cls = nn.Parameter(torch.randn(1, 1, proj_size))
+        self.global_cls = nn.Parameter(
+            torch.empty(1, 1, proj_size).normal_(std=np.sqrt(1. / proj_size))
+        )
 
         # --- Transformer ---
         encoder_layer = nn.TransformerEncoderLayer(
@@ -158,6 +162,8 @@ class TokenLevelSegmentedBert(nn.Module):
 
         # --- Attention pooling ---
         self.attn_pool = nn.Linear(proj_size, 1)
+        nn.init.xavier_uniform_(self.attn_pool.weight)
+        nn.init.zeros_(self.attn_pool.bias)
 
         # --- Classifier ---
         self.dropout = nn.Dropout(dropout_rate)
@@ -166,7 +172,6 @@ class TokenLevelSegmentedBert(nn.Module):
         # Learnable non-negative weight (via softplus) for optional carcinoma logit constraint loss.
         w_init = max(float(carcinoma_constraint_w_init), 1e-6)
         raw_init = np.log(np.expm1(w_init))
-        self.carcinoma_constraint_w_raw = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
 
     def _run_transformer_and_capture_last_attn(self, x):
         """
@@ -216,9 +221,6 @@ class TokenLevelSegmentedBert(nn.Module):
             x = self.cross_transformer.norm(x)
 
         return x, last_attn_weights
-
-    def get_carcinoma_constraint_w(self):
-        return F.softplus(self.carcinoma_constraint_w_raw)
 
     def forward(self,
                 clinical_input_ids, clinical_attention_mask,
