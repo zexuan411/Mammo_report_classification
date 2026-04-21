@@ -48,6 +48,32 @@ def stable_hash(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 
+# ============ Distributed Training Utilities ============
+def setup_distributed():
+    """Initialize distributed training environment."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size, True
+    return 0, 0, 1, False
+
+
+def cleanup_distributed(is_distributed: bool) -> None:
+    """Clean up distributed training."""
+    if is_distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+def rank0_print(rank: int, *args, **kwargs):
+    """Print only from rank 0 process."""
+    if rank == 0:
+        print(*args, **kwargs)
+
+
 def maybe_parallelize(model, device, use_data_parallel=True):
     model = model.to(device)
     if use_data_parallel and torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -186,6 +212,99 @@ def evaluate(model, loader, device, use_ordinal=False, use_amp=False, amp_dtype=
     return f1_score(trues, preds, average="macro"), np.array(preds, dtype=int)
 
 
+@torch.no_grad()
+def distributed_evaluate(model, dataset, device, batch_size, num_workers, is_distributed, rank, world_size):
+    """Evaluate on all ranks by partitioning dataset and aggregating predictions."""
+    if not is_distributed:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+        )
+        preds = []
+        trues = []
+        model.eval()
+        for batch in loader:
+            labels = batch.get("labels")
+            batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                           for k, v in batch.items()}
+            
+            outputs = model(
+                clinical_input_ids=batch_device['clinical_input_ids'],
+                clinical_attention_mask=batch_device['clinical_attention_mask'],
+                findings_input_ids=batch_device['findings_input_ids'],
+                findings_attention_mask=batch_device['findings_attention_mask'],
+                comparative_input_ids=batch_device['comparative_input_ids'],
+                comparative_attention_mask=batch_device['comparative_attention_mask']
+            )
+            pred = torch.argmax(outputs, dim=-1)
+            preds.extend(pred.cpu().numpy().tolist())
+            if labels is not None:
+                trues.extend(labels.cpu().numpy().tolist())
+        
+        if trues:
+            val_f1 = float(f1_score(trues, preds, average="macro"))
+            return val_f1, np.array(preds)
+        else:
+            return 0.0, np.array(preds)
+
+    model.eval()
+    local_indices = np.arange(len(dataset))[rank::world_size]
+    local_subset = Subset(dataset, local_indices.tolist())
+    local_loader = DataLoader(
+        local_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
+
+    local_preds = []
+    local_trues = []
+
+    for batch in local_loader:
+        labels = batch.get("labels")
+        batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                       for k, v in batch.items()}
+        
+        outputs = model(
+            clinical_input_ids=batch_device['clinical_input_ids'],
+            clinical_attention_mask=batch_device['clinical_attention_mask'],
+            findings_input_ids=batch_device['findings_input_ids'],
+            findings_attention_mask=batch_device['findings_attention_mask'],
+            comparative_input_ids=batch_device['comparative_input_ids'],
+            comparative_attention_mask=batch_device['comparative_attention_mask']
+        )
+        pred = torch.argmax(outputs, dim=-1)
+
+        local_preds.extend(pred.cpu().numpy().tolist())
+        if labels is not None:
+            local_trues.extend(labels.cpu().numpy().tolist())
+
+    gathered = [None for _ in range(world_size)]
+    dist.all_gather_object(gathered, (local_indices.tolist(), local_preds, local_trues))
+
+    pred_full = np.array([], dtype=int)
+    val_f1 = 0.0
+    if rank == 0:
+        pred_full = np.empty(len(dataset), dtype=int)
+        true_full = np.empty(len(dataset), dtype=int)
+        for idxs, preds, trues in gathered:
+            if idxs:
+                pred_full[idxs] = np.array(preds)
+                true_full[idxs] = np.array(trues)
+        
+        if true_full.size > 0:
+            val_f1 = float(f1_score(true_full, pred_full, average="macro"))
+
+    f1_tensor = torch.tensor([val_f1], dtype=torch.float32, device=device)
+    dist.broadcast(f1_tensor, src=0)
+    return float(f1_tensor.item()), pred_full
+
 def save_confusion_matrix_as_table(cm, id2label, save_path):
     """Save confusion matrix as CSV table."""
     label_names = [str(id2label[i]) for i in range(len(id2label))]
@@ -202,27 +321,17 @@ def save_classification_report_as_table(y_true, y_pred, id2label, save_path):
     report_df.to_csv(save_path)
 
 
+
 def compute_classification_loss(logits, labels, class_weights=None, use_focal_loss=False, focal_gamma=2.0):
     """
     Compute classification loss with optional focal loss.
-    
-    Args:
-        logits: Model output logits (batch_size, num_classes)
-        labels: Ground truth labels (batch_size,)
-        class_weights: Optional class weights tensor
-        use_focal_loss: Whether to apply focal loss
-        focal_gamma: Focal loss gamma parameter
     """
-    # Standard cross entropy loss
     ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction="none")
     
     if not use_focal_loss:
         return ce_loss.mean()
     
-    # Focal loss: down-weight easy examples, up-weight hard examples
-    # pt is the probability of the true class
     pt = torch.exp(-ce_loss)
-    # focal weight: (1 - pt)^gamma
     focal_weight = (1.0 - pt).pow(focal_gamma)
     focal_loss = focal_weight * ce_loss
     
@@ -241,3 +350,522 @@ def clean_and_isolate_text(s: str) -> str:
     s = re.sub(r'[0-9]+,[0-9]+', 'NUM', s)
     s = re.sub(r'[0-9]+', 'NUM', s)
     return s
+
+
+
+
+
+def _build_attention_token_labels_and_indices(tokenizer, cli_ids, cli_mask, find_ids, find_mask, comp_ids, comp_mask):
+    """
+    Build labels and exact index mapping into the concatenated sequence:
+    [G_CLS] + clinical(max_length) + findings(max_length) + comparative(max_length)
+
+    Only non-PAD token positions are included.
+    """
+    labels = ["[G_CLS]"]
+    keep_indices = [0]
+
+    seg_len = int(cli_ids.numel())
+
+    def _append_segment(input_ids, attention_mask, prefix, base_offset):
+        nonlocal labels, keep_indices
+        valid_pos = torch.nonzero(attention_mask > 0, as_tuple=False).squeeze(-1).tolist()
+        if not isinstance(valid_pos, list):
+            valid_pos = [int(valid_pos)]
+        if len(valid_pos) == 0:
+            return
+
+        token_ids = input_ids[valid_pos].tolist()
+        tokens = tokenizer.convert_ids_to_tokens(token_ids)
+        labels.extend([f"{prefix}:{tok}" for tok in tokens])
+        keep_indices.extend([base_offset + int(p) for p in valid_pos])
+
+    # +1 offset because index 0 is global CLS prepended before concatenated segment tokens.
+    _append_segment(cli_ids, cli_mask, "CLI", base_offset=1)
+    _append_segment(find_ids, find_mask, "FIND", base_offset=1 + seg_len)
+    _append_segment(comp_ids, comp_mask, "COMP", base_offset=1 + 2 * seg_len)
+
+    return labels, keep_indices
+
+
+def _merge_wordpiece_labels_and_attention(labels, attn_mean):
+    """
+    Merge consecutive WordPiece continuation tokens (##xxx) for visualization.
+    Attention matrix is block-averaged accordingly.
+    """
+    if len(labels) <= 1:
+        return labels, attn_mean
+
+    merged_labels = []
+    group_ids = []
+    current_group = -1
+
+    for label in labels:
+        if ":" not in label:
+            current_group += 1
+            merged_labels.append(label)
+            group_ids.append(current_group)
+            continue
+
+        prefix, tok = label.split(":", 1)
+        can_merge = (
+            tok.startswith("##")
+            and len(merged_labels) > 0
+            and merged_labels[-1].startswith(prefix + ":")
+        )
+
+        if can_merge:
+            merged_labels[-1] = merged_labels[-1] + tok[2:]
+            group_ids.append(current_group)
+        else:
+            current_group += 1
+            if tok.startswith("##"):
+                tok = tok[2:]
+            merged_labels.append(f"{prefix}:{tok}")
+            group_ids.append(current_group)
+
+    num_groups = max(group_ids) + 1
+    if num_groups == len(labels):
+        return labels, attn_mean
+
+    # Block-average original attention to merged-token level.
+    merged_attn = attn_mean.new_zeros((num_groups, num_groups))
+    group_to_positions = [[] for _ in range(num_groups)]
+    for pos, gid in enumerate(group_ids):
+        group_to_positions[gid].append(pos)
+
+    for i in range(num_groups):
+        row_idx = torch.tensor(group_to_positions[i], device=attn_mean.device, dtype=torch.long)
+        for j in range(num_groups):
+            col_idx = torch.tensor(group_to_positions[j], device=attn_mean.device, dtype=torch.long)
+            merged_attn[i, j] = attn_mean.index_select(0, row_idx).index_select(1, col_idx).mean()
+
+    return merged_labels, merged_attn
+
+
+@torch.no_grad()
+def save_attention_heatmap_for_sample(
+    model,
+    tokenizer,
+    clinical_text,
+    findings_text,
+    comparative_text,
+    max_length,
+    device,
+    save_path,
+    max_tokens=120,
+    merge_wordpieces=True,
+):
+    """Extract last-layer attention (first sample) and save heatmap with token labels."""
+    model.eval()
+
+    enc_list = make_segmented_encodings(
+        tokenizer,
+        [clinical_text],
+        [findings_text],
+        [comparative_text],
+        max_length,
+    )
+    cli_enc, find_enc, comp_enc = enc_list[0]
+
+    cli_ids = cli_enc["input_ids"].unsqueeze(0).to(device)
+    cli_mask = cli_enc["attention_mask"].unsqueeze(0).to(device)
+    find_ids = find_enc["input_ids"].unsqueeze(0).to(device)
+    find_mask = find_enc["attention_mask"].unsqueeze(0).to(device)
+    comp_ids = comp_enc["input_ids"].unsqueeze(0).to(device)
+    comp_mask = comp_enc["attention_mask"].unsqueeze(0).to(device)
+
+    outputs = model(
+        clinical_input_ids=cli_ids,
+        clinical_attention_mask=cli_mask,
+        findings_input_ids=find_ids,
+        findings_attention_mask=find_mask,
+        comparative_input_ids=comp_ids,
+        comparative_attention_mask=comp_mask,
+        return_last_layer_attn=True,
+    )
+
+    if not isinstance(outputs, tuple) or len(outputs) < 2:
+        raise RuntimeError("Model did not return attention weights. Check return_last_layer_attn flow.")
+
+    _, last_attn = outputs
+    if last_attn is None:
+        raise RuntimeError("Last layer attention is None.")
+
+    # last_attn expected shape: (batch, heads, seq, seq) with average_attn_weights=False
+    attn_first_sample = last_attn[0]  # (heads, seq, seq)
+    attn_mean = attn_first_sample.mean(dim=0)  # (seq, seq)
+
+    token_labels, keep_indices = _build_attention_token_labels_and_indices(
+        tokenizer,
+        cli_enc["input_ids"],
+        cli_enc["attention_mask"],
+        find_enc["input_ids"],
+        find_enc["attention_mask"],
+        comp_enc["input_ids"],
+        comp_enc["attention_mask"],
+    )
+
+    seq_len = attn_mean.size(0)
+    valid_pairs = [(idx, label) for idx, label in zip(keep_indices, token_labels) if 0 <= idx < seq_len]
+    if len(valid_pairs) == 0:
+        raise RuntimeError("No valid non-PAD attention indices found for visualization.")
+
+    keep_indices = [p[0] for p in valid_pairs]
+    token_labels = [p[1] for p in valid_pairs]
+
+    if max_tokens and len(token_labels) > max_tokens:
+        keep_indices = keep_indices[:max_tokens]
+        token_labels = token_labels[:max_tokens]
+
+    index_keep_t = torch.tensor(keep_indices, device=attn_mean.device, dtype=torch.long)
+    attn_mean = attn_mean.index_select(0, index_keep_t).index_select(1, index_keep_t)
+
+    merged_labels_for_txt = token_labels  # Keep original for txt (before merge)
+    if merge_wordpieces:
+        token_labels, attn_mean = _merge_wordpiece_labels_and_attention(token_labels, attn_mean)
+
+    attn_mean_cpu = attn_mean.detach().cpu()
+    attn_np = attn_mean_cpu.numpy()
+
+    n = len(token_labels)
+    fig_side = max(8, min(26, int(0.28 * n) + 6))
+    plt.figure(figsize=(fig_side, fig_side))
+
+    # Use robust color scaling to avoid near-uniform heatmap when values are in a narrow band.
+    vmin = float(np.percentile(attn_np, 2))
+    vmax = float(np.percentile(attn_np, 98))
+    if vmax <= vmin:
+        vmin, vmax = None, None
+
+    plt.imshow(attn_np, aspect='auto', interpolation='nearest', vmin=vmin, vmax=vmax, cmap='viridis')
+    plt.colorbar()
+
+    if n <= 80:
+        ticks = np.arange(n)
+    else:
+        step = max(1, n // 40)
+        ticks = np.arange(0, n, step)
+
+    plt.xticks(ticks, [token_labels[i] for i in ticks], rotation=90, fontsize=7)
+    plt.yticks(ticks, [token_labels[i] for i in ticks], fontsize=7)
+    plt.title("Last-layer mean attention ([G_CLS] + non-PAD report tokens)")
+    plt.tight_layout()
+
+    out_dir = os.path.dirname(save_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    plt.savefig(save_path, dpi=220)
+    plt.close()
+
+    # ===== Save txt report with token labels and attention values =====
+    txt_path = save_path.replace('.png', '_attention_report.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 100 + "\n")
+        f.write("ATTENTION VISUALIZATION REPORT\n")
+        f.write("=" * 100 + "\n\n")
+
+        # Original texts
+        f.write("ORIGINAL REPORT SEGMENTS:\n")
+        f.write("-" * 100 + "\n")
+        f.write(f"Clinical Indication:\n{clinical_text}\n\n")
+        f.write(f"Findings:\n{findings_text}\n\n")
+        f.write(f"Comparative Analysis:\n{comparative_text}\n")
+        f.write("-" * 100 + "\n\n")
+
+        # Reconstructed text from tokens
+        f.write("RECONSTRUCTED TEXT FROM TOKENS:\n")
+        f.write("-" * 100 + "\n")
+        reconstructed = _reconstruct_text_from_labels(token_labels)
+        f.write(reconstructed + "\n")
+        f.write("-" * 100 + "\n\n")
+
+        # Token-level attention analysis
+        f.write("TOKEN-LEVEL ATTENTION ANALYSIS:\n")
+        f.write("-" * 100 + "\n")
+        f.write(f"{'Index':<6} {'Token/Label':<30} {'Avg Attention':<15} {'Max Attention':<15}\n")
+        f.write("-" * 100 + "\n")
+
+        for i, label in enumerate(token_labels):
+            avg_attn = float(attn_np[i, :].mean())
+            max_attn = float(attn_np[i, :].max())
+            f.write(f"{i:<6} {label:<30} {avg_attn:<15.6f} {max_attn:<15.6f}\n")
+
+        f.write("-" * 100 + "\n\n")
+
+        # Attention matrix summary
+        f.write("ATTENTION MATRIX STATISTICS:\n")
+        f.write("-" * 100 + "\n")
+        f.write(f"Matrix shape: {attn_np.shape}\n")
+        f.write(f"Min attention: {float(attn_np.min()):.6f}\n")
+        f.write(f"Max attention: {float(attn_np.max()):.6f}\n")
+        f.write(f"Mean attention: {float(attn_np.mean()):.6f}\n")
+        f.write(f"Std attention: {float(attn_np.std()):.6f}\n")
+        f.write("-" * 100 + "\n\n")
+
+        # Top attention patterns (CLS attention to tokens)
+        if "[G_CLS]" in token_labels:
+            cls_idx = token_labels.index("[G_CLS]")
+            cls_attention = attn_np[cls_idx, :]
+            top_attn_idx = np.argsort(cls_attention)[::-1][:10]
+            f.write("[G_CLS] TOKEN TOP ATTENTION TARGETS:\n")
+            f.write("-" * 100 + "\n")
+            for rank, idx in enumerate(top_attn_idx, 1):
+                f.write(f"Rank {rank}: {token_labels[idx]:<30} attention={cls_attention[idx]:.6f}\n")
+            f.write("-" * 100 + "\n\n")
+        
+        # Append serialized attention matrix for regeneration
+        _append_attention_matrix_to_txt(f, token_labels, attn_np)
+
+
+
+def _reconstruct_text_from_labels(token_labels):
+    """
+    Reconstruct readable text from token labels by removing prefixes and merging subword tokens.
+    Properly handles space insertion between regular tokens and subword tokens (##).
+    """
+    segments = {}  # {segment_name: [(token, is_subword)]}
+
+    for label in token_labels:
+        if label == "[G_CLS]":
+            continue
+
+        if ":" in label:
+            prefix, token = label.split(":", 1)
+            if prefix not in segments:
+                segments[prefix] = []
+            
+            # Check if this is a subword token
+            is_subword = token.startswith("##")
+            if is_subword:
+                token = token[2:]  # Remove ## prefix
+            
+            # Skip special tokens but track them for proper spacing
+            if token not in ["[CLS]", "[SEP]", "[PAD]"]:
+                segments[prefix].append((token, is_subword))
+
+    # Reconstruct text for each segment
+    reconstructed_lines = []
+    for seg_name in ["CLI", "FIND", "COMP"]:
+        if seg_name in segments:
+            seg_label = {
+                "CLI": "Clinical Indication",
+                "FIND": "Findings",
+                "COMP": "Comparative Analysis",
+            }[seg_name]
+
+            tokens_info = segments[seg_name]
+            # Build text with proper spacing
+            text_parts = []
+            for token, is_subword in tokens_info:
+                if is_subword:
+                    # Subword tokens are directly appended (no space)
+                    if text_parts:
+                        text_parts[-1] += token
+                else:
+                    # Regular tokens are added as separate parts (space will separate them)
+                    text_parts.append(token)
+
+            text = " ".join(text_parts)
+            reconstructed_lines.append(f"{seg_label}: {text}")
+
+    return "\n".join(reconstructed_lines)
+
+
+def _append_attention_matrix_to_txt(f, token_labels, attn_np):
+    """
+    Append serialized attention matrix to txt file for later reconstruction.
+    Saves in a parseable format that can be used to regenerate PNG.
+    """
+    import json
+    
+    f.write("=" * 100 + "\n")
+    f.write("SERIALIZED ATTENTION MATRIX (for PNG regeneration)\n")
+    f.write("=" * 100 + "\n\n")
+    
+    # Save metadata
+    f.write("METADATA:\n")
+    f.write("-" * 100 + "\n")
+    f.write(f"Token count: {len(token_labels)}\n")
+    f.write(f"Matrix shape: {attn_np.shape}\n")
+    f.write(f"Data type: float32\n")
+    f.write("-" * 100 + "\n\n")
+    
+    # Save token labels as JSON
+    f.write("TOKEN_LABELS:\n")
+    f.write("-" * 100 + "\n")
+    token_json = json.dumps(token_labels, ensure_ascii=False, indent=2)
+    f.write(token_json + "\n")
+    f.write("-" * 100 + "\n\n")
+    
+    # Save attention matrix as CSV
+    f.write("ATTENTION_MATRIX_CSV:\n")
+    f.write("-" * 100 + "\n")
+    f.write("# Format: comma-separated values, one row per line\n")
+    f.write("# To reconstruct: np.loadtxt(StringIO(csv_block), delimiter=',')\n\n")
+    
+    for i, row in enumerate(attn_np):
+        row_str = ",".join([f"{v:.6e}" for v in row])
+        f.write(row_str + "\n")
+    
+    f.write("-" * 100 + "\n\n")
+
+
+def regenerate_attention_heatmap_from_txt(txt_path, output_png_path, max_tokens=120):
+    """
+    Regenerate attention heatmap from saved txt report.
+    Reads serialized attention matrix and token labels from txt.
+    """
+    import json
+    from io import StringIO
+    
+    rank0_print(0, f"[INFO] Regenerating heatmap from txt: {txt_path}")
+    
+    try:
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Extract TOKEN_LABELS section
+        token_start = content.find("TOKEN_LABELS:\n") + len("TOKEN_LABELS:\n")
+        token_end = content.find("-" * 100 + "\n\n", token_start)
+        token_section = content[token_start:token_end].strip()
+        token_labels = json.loads(token_section)
+        
+        # Extract ATTENTION_MATRIX_CSV section
+        attn_start = content.find("ATTENTION_MATRIX_CSV:\n") + len("ATTENTION_MATRIX_CSV:\n")
+        attn_start = content.find("\n", attn_start) + 1  # Skip comment line
+        attn_start = content.find("\n", attn_start) + 1  # Skip blank line
+        attn_end = content.find("-" * 100 + "\n\n", attn_start)
+        attn_section = content[attn_start:attn_end].strip()
+        
+        # Parse CSV
+        attn_np = np.loadtxt(StringIO(attn_section), delimiter=',')
+        
+        # Limit tokens if specified
+        if max_tokens and len(token_labels) > max_tokens:
+            attn_np = attn_np[:max_tokens, :max_tokens]
+            token_labels = token_labels[:max_tokens]
+        
+        # Generate heatmap
+        n = len(token_labels)
+        fig_side = max(8, min(26, int(0.28 * n) + 6))
+        plt.figure(figsize=(fig_side, fig_side))
+        
+        vmin = float(np.percentile(attn_np, 2))
+        vmax = float(np.percentile(attn_np, 98))
+        if vmax <= vmin:
+            vmin, vmax = None, None
+        
+        plt.imshow(attn_np, aspect='auto', interpolation='nearest', vmin=vmin, vmax=vmax, cmap='viridis')
+        plt.colorbar()
+        
+        if n <= 80:
+            ticks = np.arange(n)
+        else:
+            step = max(1, n // 40)
+            ticks = np.arange(0, n, step)
+        
+        plt.xticks(ticks, [token_labels[i] for i in ticks], rotation=90, fontsize=7)
+        plt.yticks(ticks, [token_labels[i] for i in ticks], fontsize=7)
+        plt.title("Last-layer mean attention ([G_CLS] + non-PAD report tokens)")
+        plt.tight_layout()
+        
+        plt.savefig(output_png_path, dpi=220)
+        plt.close()
+        
+        rank0_print(0, f"[INFO] Successfully regenerated: {output_png_path}")
+        return True
+        
+    except Exception as e:
+        rank0_print(0, f"[WARN] Failed to regenerate heatmap from txt: {e}")
+        return False
+
+
+def maybe_extract_attention_after_run(
+    args,
+    tokenizer,
+    train_df,
+    test_df,
+    num_labels,
+    device,
+    rank,
+    preferred_ckpt_path=None,
+    preferred_fold=None,
+):
+    """Optionally extract and save attention heatmap from the latest available fold checkpoint."""
+    if not args.extract_attention_after_train or rank != 0:
+        return
+
+    selected_fold = None
+    selected_ckpt = None
+
+    if preferred_ckpt_path and os.path.exists(preferred_ckpt_path):
+        selected_ckpt = preferred_ckpt_path
+        selected_fold = preferred_fold
+    else:
+        for fold in range(1, args.n_splits + 1):
+            pattern = os.path.join(args.ckpt_dir, f"fold_{fold}_epoch_*.pt")
+            ckpts = glob.glob(pattern)
+            if ckpts:
+                latest_ckpt = max(ckpts, key=os.path.getctime)
+                if selected_ckpt is None or os.path.getctime(latest_ckpt) > os.path.getctime(selected_ckpt):
+                    selected_ckpt = latest_ckpt
+                    selected_fold = fold
+
+    if selected_ckpt is None:
+        rank0_print(rank, "[WARN] Attention extraction skipped: no fold checkpoint found.")
+        return
+
+    if args.attention_source == "train":
+        if len(train_df) == 0:
+            rank0_print(rank, "[WARN] Attention extraction skipped: train dataframe is empty.")
+            return
+        sample_idx = max(0, min(args.attention_sample_index, len(train_df) - 1))
+        row = train_df.iloc[sample_idx]
+        cli_text = "" if pd.isna(row.get("clinical_indication", "")) else str(row.get("clinical_indication", ""))
+        find_text = "" if pd.isna(row.get("findings", "")) else str(row.get("findings", ""))
+        comp_text = "" if pd.isna(row.get("comparative_analysis", "")) else str(row.get("comparative_analysis", ""))
+    else:
+        if len(test_df) == 0:
+            rank0_print(rank, "[WARN] Attention extraction skipped: test dataframe is empty.")
+            return
+        sample_idx = max(0, min(args.attention_sample_index, len(test_df) - 1))
+        row = test_df.iloc[sample_idx]
+        report_text = "" if pd.isna(row.get("report", "")) else str(row.get("report", ""))
+        sections = split_report_by_sections(report_text)
+        cli_text = sections.get('clinical_indication', '')
+        find_text = sections.get('findings', '')
+        comp_text = sections.get('comparative_analysis', '')
+
+    vis_model = TokenLevelSegmentedBert(
+        args.model_name,
+        num_labels=num_labels
+    )
+    ckpt_data = torch.load(selected_ckpt, map_location=device)
+    vis_model.load_state_dict(ckpt_data['model_state_dict'], strict=False)
+    vis_model = vis_model.to(device)
+
+    if args.attention_save_path:
+        save_path = args.attention_save_path
+    else:
+        save_path = os.path.join(
+            args.ckpt_dir,
+            f"attention_last_layer_fold{selected_fold}_{args.attention_source}_idx{sample_idx}.png",
+        )
+
+    save_attention_heatmap_for_sample(
+        model=vis_model,
+        tokenizer=tokenizer,
+        clinical_text=cli_text,
+        findings_text=find_text,
+        comparative_text=comp_text,
+        max_length=args.max_length,
+        device=device,
+        save_path=save_path,
+        max_tokens=args.attention_max_tokens,
+        merge_wordpieces=args.attention_merge_wordpieces,
+    )
+    rank0_print(
+        rank,
+        f"[INFO] Saved attention heatmap from fold {selected_fold}, sample idx {sample_idx} ({args.attention_source}) to: {save_path}",
+    )

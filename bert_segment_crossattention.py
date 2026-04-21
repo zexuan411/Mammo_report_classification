@@ -31,8 +31,13 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 from peft import LoraConfig, get_peft_model, TaskType
-from modules import set_seed, clean_text, stable_hash, maybe_parallelize, save_checkpoint, load_checkpoint, find_latest_ckpt, evaluate, make_encodings, TextDataset, load_model_state_compat, save_confusion_matrix_as_table, save_classification_report_as_table
-from data_segmentation import split_report_by_sections, TokenLevelSegmentedBert, make_segmented_encodings
+from modules import (
+    set_seed, clean_text, stable_hash, compute_classification_loss,
+    maybe_parallelize, save_checkpoint, load_checkpoint, find_latest_ckpt, setup_distributed,cleanup_distributed, rank0_print,
+    distributed_evaluate, make_encodings, TextDataset, load_model_state_compat, save_confusion_matrix_as_table, save_classification_report_as_table, 
+    save_attention_heatmap_for_sample, maybe_extract_attention_after_run,
+)
+from data_segmentation import split_report_by_sections, TokenLevelSegmentedBert, make_segmented_encodings, SegmentedTextDataset
 
 import warnings 
 warnings.filterwarnings("ignore")
@@ -43,551 +48,6 @@ N_SPLITS = 5
 TRAIN_PATH = "./train_split.csv"  # Use pre-segmented data
 TEST_PATH = "./test.csv"
 SUB_PATH = "./submission.csv"
-
-
-# ============ Distributed Training Utilities ============
-def setup_distributed():
-    """Initialize distributed training environment."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-        return rank, local_rank, world_size, True
-    return 0, 0, 1, False
-
-def cleanup_distributed(is_distributed: bool) -> None:
-    """Clean up distributed training."""
-    if is_distributed and dist.is_initialized():
-        dist.destroy_process_group()
-
-def rank0_print(rank: int, *args, **kwargs):
-    """Print only from rank 0 process."""
-    if rank == 0:
-        print(*args, **kwargs)
-
-
-@torch.no_grad()
-def distributed_evaluate(model, dataset, device, batch_size, num_workers, is_distributed, rank, world_size):
-    """Evaluate on all ranks by partitioning dataset and aggregating predictions."""
-    if not is_distributed:
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers=num_workers > 0,
-        )
-        preds = []
-        trues = []
-        model.eval()
-        for batch in loader:
-            labels = batch.get("labels")
-            batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                           for k, v in batch.items()}
-            
-            outputs = model(
-                clinical_input_ids=batch_device['clinical_input_ids'],
-                clinical_attention_mask=batch_device['clinical_attention_mask'],
-                findings_input_ids=batch_device['findings_input_ids'],
-                findings_attention_mask=batch_device['findings_attention_mask'],
-                comparative_input_ids=batch_device['comparative_input_ids'],
-                comparative_attention_mask=batch_device['comparative_attention_mask']
-            )
-            pred = torch.argmax(outputs, dim=-1)
-            preds.extend(pred.cpu().numpy().tolist())
-            if labels is not None:
-                trues.extend(labels.cpu().numpy().tolist())
-        
-        if trues:
-            val_f1 = float(f1_score(trues, preds, average="macro"))
-            return val_f1, np.array(preds)
-        else:
-            return 0.0, np.array(preds)
-
-    model.eval()
-    local_indices = np.arange(len(dataset))[rank::world_size]
-    local_subset = Subset(dataset, local_indices.tolist())
-    local_loader = DataLoader(
-        local_subset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-    )
-
-    local_preds = []
-    local_trues = []
-
-    for batch in local_loader:
-        labels = batch.get("labels")
-        batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                       for k, v in batch.items()}
-        
-        outputs = model(
-            clinical_input_ids=batch_device['clinical_input_ids'],
-            clinical_attention_mask=batch_device['clinical_attention_mask'],
-            findings_input_ids=batch_device['findings_input_ids'],
-            findings_attention_mask=batch_device['findings_attention_mask'],
-            comparative_input_ids=batch_device['comparative_input_ids'],
-            comparative_attention_mask=batch_device['comparative_attention_mask']
-        )
-        pred = torch.argmax(outputs, dim=-1)
-
-        local_preds.extend(pred.cpu().numpy().tolist())
-        if labels is not None:
-            local_trues.extend(labels.cpu().numpy().tolist())
-
-    gathered = [None for _ in range(world_size)]
-    dist.all_gather_object(gathered, (local_indices.tolist(), local_preds, local_trues))
-
-    pred_full = np.array([], dtype=int)
-    val_f1 = 0.0
-    if rank == 0:
-        pred_full = np.empty(len(dataset), dtype=int)
-        true_full = np.empty(len(dataset), dtype=int)
-        for idxs, preds, trues in gathered:
-            if idxs:
-                pred_full[idxs] = np.array(preds)
-                true_full[idxs] = np.array(trues)
-        
-        if true_full.size > 0:
-            val_f1 = float(f1_score(true_full, pred_full, average="macro"))
-
-    f1_tensor = torch.tensor([val_f1], dtype=torch.float32, device=device)
-    dist.broadcast(f1_tensor, src=0)
-    return float(f1_tensor.item()), pred_full
-
-
-def build_text_column(series, args):
-    text = series.apply(clean_text)
-    return text
-
-
-def compute_classification_loss(logits, labels, class_weights=None, use_focal_loss=False, focal_gamma=2.0):
-    """
-    Compute classification loss with optional focal loss.
-    """
-    ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction="none")
-    
-    if not use_focal_loss:
-        return ce_loss.mean()
-    
-    pt = torch.exp(-ce_loss)
-    focal_weight = (1.0 - pt).pow(focal_gamma)
-    focal_loss = focal_weight * ce_loss
-    
-    return focal_loss.mean()
-
-
-
-def _build_attention_token_labels_and_indices(tokenizer, cli_ids, cli_mask, find_ids, find_mask, comp_ids, comp_mask):
-    """
-    Build labels and exact index mapping into the concatenated sequence:
-    [G_CLS] + clinical(max_length) + findings(max_length) + comparative(max_length)
-
-    Only non-PAD token positions are included.
-    """
-    labels = ["[G_CLS]"]
-    keep_indices = [0]
-
-    seg_len = int(cli_ids.numel())
-
-    def _append_segment(input_ids, attention_mask, prefix, base_offset):
-        nonlocal labels, keep_indices
-        valid_pos = torch.nonzero(attention_mask > 0, as_tuple=False).squeeze(-1).tolist()
-        if not isinstance(valid_pos, list):
-            valid_pos = [int(valid_pos)]
-        if len(valid_pos) == 0:
-            return
-
-        token_ids = input_ids[valid_pos].tolist()
-        tokens = tokenizer.convert_ids_to_tokens(token_ids)
-        labels.extend([f"{prefix}:{tok}" for tok in tokens])
-        keep_indices.extend([base_offset + int(p) for p in valid_pos])
-
-    # +1 offset because index 0 is global CLS prepended before concatenated segment tokens.
-    _append_segment(cli_ids, cli_mask, "CLI", base_offset=1)
-    _append_segment(find_ids, find_mask, "FIND", base_offset=1 + seg_len)
-    _append_segment(comp_ids, comp_mask, "COMP", base_offset=1 + 2 * seg_len)
-
-    return labels, keep_indices
-
-
-def _merge_wordpiece_labels_and_attention(labels, attn_mean):
-    """
-    Merge consecutive WordPiece continuation tokens (##xxx) for visualization.
-    Attention matrix is block-averaged accordingly.
-    """
-    if len(labels) <= 1:
-        return labels, attn_mean
-
-    merged_labels = []
-    group_ids = []
-    current_group = -1
-
-    for label in labels:
-        if ":" not in label:
-            current_group += 1
-            merged_labels.append(label)
-            group_ids.append(current_group)
-            continue
-
-        prefix, tok = label.split(":", 1)
-        can_merge = (
-            tok.startswith("##")
-            and len(merged_labels) > 0
-            and merged_labels[-1].startswith(prefix + ":")
-        )
-
-        if can_merge:
-            merged_labels[-1] = merged_labels[-1] + tok[2:]
-            group_ids.append(current_group)
-        else:
-            current_group += 1
-            if tok.startswith("##"):
-                tok = tok[2:]
-            merged_labels.append(f"{prefix}:{tok}")
-            group_ids.append(current_group)
-
-    num_groups = max(group_ids) + 1
-    if num_groups == len(labels):
-        return labels, attn_mean
-
-    # Block-average original attention to merged-token level.
-    merged_attn = attn_mean.new_zeros((num_groups, num_groups))
-    group_to_positions = [[] for _ in range(num_groups)]
-    for pos, gid in enumerate(group_ids):
-        group_to_positions[gid].append(pos)
-
-    for i in range(num_groups):
-        row_idx = torch.tensor(group_to_positions[i], device=attn_mean.device, dtype=torch.long)
-        for j in range(num_groups):
-            col_idx = torch.tensor(group_to_positions[j], device=attn_mean.device, dtype=torch.long)
-            merged_attn[i, j] = attn_mean.index_select(0, row_idx).index_select(1, col_idx).mean()
-
-    return merged_labels, merged_attn
-
-
-@torch.no_grad()
-def save_attention_heatmap_for_sample(
-    model,
-    tokenizer,
-    clinical_text,
-    findings_text,
-    comparative_text,
-    max_length,
-    device,
-    save_path,
-    max_tokens=120,
-    merge_wordpieces=True,
-):
-    """Extract last-layer attention (first sample) and save heatmap with token labels."""
-    model.eval()
-
-    enc_list = make_segmented_encodings(
-        tokenizer,
-        [clinical_text],
-        [findings_text],
-        [comparative_text],
-        max_length,
-    )
-    cli_enc, find_enc, comp_enc = enc_list[0]
-
-    cli_ids = cli_enc["input_ids"].unsqueeze(0).to(device)
-    cli_mask = cli_enc["attention_mask"].unsqueeze(0).to(device)
-    find_ids = find_enc["input_ids"].unsqueeze(0).to(device)
-    find_mask = find_enc["attention_mask"].unsqueeze(0).to(device)
-    comp_ids = comp_enc["input_ids"].unsqueeze(0).to(device)
-    comp_mask = comp_enc["attention_mask"].unsqueeze(0).to(device)
-
-    outputs = model(
-        clinical_input_ids=cli_ids,
-        clinical_attention_mask=cli_mask,
-        findings_input_ids=find_ids,
-        findings_attention_mask=find_mask,
-        comparative_input_ids=comp_ids,
-        comparative_attention_mask=comp_mask,
-        return_last_layer_attn=True,
-    )
-
-    if not isinstance(outputs, tuple) or len(outputs) < 2:
-        raise RuntimeError("Model did not return attention weights. Check return_last_layer_attn flow.")
-
-    _, last_attn = outputs
-    if last_attn is None:
-        raise RuntimeError("Last layer attention is None.")
-
-    # last_attn expected shape: (batch, heads, seq, seq) with average_attn_weights=False
-    attn_first_sample = last_attn[0]  # (heads, seq, seq)
-    attn_mean = attn_first_sample.mean(dim=0)  # (seq, seq)
-
-    token_labels, keep_indices = _build_attention_token_labels_and_indices(
-        tokenizer,
-        cli_enc["input_ids"],
-        cli_enc["attention_mask"],
-        find_enc["input_ids"],
-        find_enc["attention_mask"],
-        comp_enc["input_ids"],
-        comp_enc["attention_mask"],
-    )
-
-    seq_len = attn_mean.size(0)
-    valid_pairs = [(idx, label) for idx, label in zip(keep_indices, token_labels) if 0 <= idx < seq_len]
-    if len(valid_pairs) == 0:
-        raise RuntimeError("No valid non-PAD attention indices found for visualization.")
-
-    keep_indices = [p[0] for p in valid_pairs]
-    token_labels = [p[1] for p in valid_pairs]
-
-    if max_tokens and len(token_labels) > max_tokens:
-        keep_indices = keep_indices[:max_tokens]
-        token_labels = token_labels[:max_tokens]
-
-    index_keep_t = torch.tensor(keep_indices, device=attn_mean.device, dtype=torch.long)
-    attn_mean = attn_mean.index_select(0, index_keep_t).index_select(1, index_keep_t)
-
-    merged_labels_for_txt = token_labels  # Keep original for txt (before merge)
-    if merge_wordpieces:
-        token_labels, attn_mean = _merge_wordpiece_labels_and_attention(token_labels, attn_mean)
-
-    attn_mean_cpu = attn_mean.detach().cpu()
-    attn_np = attn_mean_cpu.numpy()
-
-    n = len(token_labels)
-    fig_side = max(8, min(26, int(0.28 * n) + 6))
-    plt.figure(figsize=(fig_side, fig_side))
-
-    # Use robust color scaling to avoid near-uniform heatmap when values are in a narrow band.
-    vmin = float(np.percentile(attn_np, 2))
-    vmax = float(np.percentile(attn_np, 98))
-    if vmax <= vmin:
-        vmin, vmax = None, None
-
-    plt.imshow(attn_np, aspect='auto', interpolation='nearest', vmin=vmin, vmax=vmax, cmap='viridis')
-    plt.colorbar()
-
-    if n <= 80:
-        ticks = np.arange(n)
-    else:
-        step = max(1, n // 40)
-        ticks = np.arange(0, n, step)
-
-    plt.xticks(ticks, [token_labels[i] for i in ticks], rotation=90, fontsize=7)
-    plt.yticks(ticks, [token_labels[i] for i in ticks], fontsize=7)
-    plt.title("Last-layer mean attention ([G_CLS] + non-PAD report tokens)")
-    plt.tight_layout()
-
-    out_dir = os.path.dirname(save_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    plt.savefig(save_path, dpi=220)
-    plt.close()
-
-    # ===== Save txt report with token labels and attention values =====
-    txt_path = save_path.replace('.png', '_attention_report.txt')
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 100 + "\n")
-        f.write("ATTENTION VISUALIZATION REPORT\n")
-        f.write("=" * 100 + "\n\n")
-
-        # Original texts
-        f.write("ORIGINAL REPORT SEGMENTS:\n")
-        f.write("-" * 100 + "\n")
-        f.write(f"Clinical Indication:\n{clinical_text}\n\n")
-        f.write(f"Findings:\n{findings_text}\n\n")
-        f.write(f"Comparative Analysis:\n{comparative_text}\n")
-        f.write("-" * 100 + "\n\n")
-
-        # Reconstructed text from tokens
-        f.write("RECONSTRUCTED TEXT FROM TOKENS:\n")
-        f.write("-" * 100 + "\n")
-        reconstructed = _reconstruct_text_from_labels(token_labels)
-        f.write(reconstructed + "\n")
-        f.write("-" * 100 + "\n\n")
-
-        # Token-level attention analysis
-        f.write("TOKEN-LEVEL ATTENTION ANALYSIS:\n")
-        f.write("-" * 100 + "\n")
-        f.write(f"{'Index':<6} {'Token/Label':<30} {'Avg Attention':<15} {'Max Attention':<15}\n")
-        f.write("-" * 100 + "\n")
-
-        for i, label in enumerate(token_labels):
-            avg_attn = float(attn_np[i, :].mean())
-            max_attn = float(attn_np[i, :].max())
-            f.write(f"{i:<6} {label:<30} {avg_attn:<15.6f} {max_attn:<15.6f}\n")
-
-        f.write("-" * 100 + "\n\n")
-
-        # Attention matrix summary
-        f.write("ATTENTION MATRIX STATISTICS:\n")
-        f.write("-" * 100 + "\n")
-        f.write(f"Matrix shape: {attn_np.shape}\n")
-        f.write(f"Min attention: {float(attn_np.min()):.6f}\n")
-        f.write(f"Max attention: {float(attn_np.max()):.6f}\n")
-        f.write(f"Mean attention: {float(attn_np.mean()):.6f}\n")
-        f.write(f"Std attention: {float(attn_np.std()):.6f}\n")
-        f.write("-" * 100 + "\n\n")
-
-        # Top attention patterns (CLS attention to tokens)
-        if "[G_CLS]" in token_labels:
-            cls_idx = token_labels.index("[G_CLS]")
-            cls_attention = attn_np[cls_idx, :]
-            top_attn_idx = np.argsort(cls_attention)[::-1][:10]
-            f.write("[G_CLS] TOKEN TOP ATTENTION TARGETS:\n")
-            f.write("-" * 100 + "\n")
-            for rank, idx in enumerate(top_attn_idx, 1):
-                f.write(f"Rank {rank}: {token_labels[idx]:<30} attention={cls_attention[idx]:.6f}\n")
-            f.write("-" * 100 + "\n")
-
-
-def _reconstruct_text_from_labels(token_labels):
-    """
-    Reconstruct readable text from token labels by removing prefixes and merging subword tokens.
-    Properly handles space insertion between regular tokens and subword tokens (##).
-    """
-    segments = {}  # {segment_name: [(token, is_subword)]}
-
-    for label in token_labels:
-        if label == "[G_CLS]":
-            continue
-
-        if ":" in label:
-            prefix, token = label.split(":", 1)
-            if prefix not in segments:
-                segments[prefix] = []
-            
-            # Check if this is a subword token
-            is_subword = token.startswith("##")
-            if is_subword:
-                token = token[2:]  # Remove ## prefix
-            
-            # Skip special tokens but track them for proper spacing
-            if token not in ["[CLS]", "[SEP]", "[PAD]"]:
-                segments[prefix].append((token, is_subword))
-
-    # Reconstruct text for each segment
-    reconstructed_lines = []
-    for seg_name in ["CLI", "FIND", "COMP"]:
-        if seg_name in segments:
-            seg_label = {
-                "CLI": "Clinical Indication",
-                "FIND": "Findings",
-                "COMP": "Comparative Analysis",
-            }[seg_name]
-
-            tokens_info = segments[seg_name]
-            # Build text with proper spacing
-            text_parts = []
-            for token, is_subword in tokens_info:
-                if is_subword:
-                    # Subword tokens are directly appended (no space)
-                    if text_parts:
-                        text_parts[-1] += token
-                else:
-                    # Regular tokens are added as separate parts (space will separate them)
-                    text_parts.append(token)
-
-            text = " ".join(text_parts)
-            reconstructed_lines.append(f"{seg_label}: {text}")
-
-    return "\n".join(reconstructed_lines)
-
-
-def maybe_extract_attention_after_run(
-    args,
-    tokenizer,
-    train_df,
-    test_df,
-    num_labels,
-    device,
-    rank,
-    preferred_ckpt_path=None,
-    preferred_fold=None,
-):
-    """Optionally extract and save attention heatmap from the latest available fold checkpoint."""
-    if not args.extract_attention_after_train or rank != 0:
-        return
-
-    selected_fold = None
-    selected_ckpt = None
-
-    if preferred_ckpt_path and os.path.exists(preferred_ckpt_path):
-        selected_ckpt = preferred_ckpt_path
-        selected_fold = preferred_fold
-    else:
-        for fold in range(1, args.n_splits + 1):
-            pattern = os.path.join(args.ckpt_dir, f"fold_{fold}_epoch_*.pt")
-            ckpts = glob.glob(pattern)
-            if ckpts:
-                latest_ckpt = max(ckpts, key=os.path.getctime)
-                if selected_ckpt is None or os.path.getctime(latest_ckpt) > os.path.getctime(selected_ckpt):
-                    selected_ckpt = latest_ckpt
-                    selected_fold = fold
-
-    if selected_ckpt is None:
-        rank0_print(rank, "[WARN] Attention extraction skipped: no fold checkpoint found.")
-        return
-
-    if args.attention_source == "train":
-        if len(train_df) == 0:
-            rank0_print(rank, "[WARN] Attention extraction skipped: train dataframe is empty.")
-            return
-        sample_idx = max(0, min(args.attention_sample_index, len(train_df) - 1))
-        row = train_df.iloc[sample_idx]
-        cli_text = "" if pd.isna(row.get("clinical_indication", "")) else str(row.get("clinical_indication", ""))
-        find_text = "" if pd.isna(row.get("findings", "")) else str(row.get("findings", ""))
-        comp_text = "" if pd.isna(row.get("comparative_analysis", "")) else str(row.get("comparative_analysis", ""))
-    else:
-        if len(test_df) == 0:
-            rank0_print(rank, "[WARN] Attention extraction skipped: test dataframe is empty.")
-            return
-        sample_idx = max(0, min(args.attention_sample_index, len(test_df) - 1))
-        row = test_df.iloc[sample_idx]
-        report_text = "" if pd.isna(row.get("report", "")) else str(row.get("report", ""))
-        sections = split_report_by_sections(report_text)
-        cli_text = sections.get('clinical_indication', '')
-        find_text = sections.get('findings', '')
-        comp_text = sections.get('comparative_analysis', '')
-
-    vis_model = TokenLevelSegmentedBert(
-        args.model_name,
-        num_labels=num_labels,
-        carcinoma_constraint_w_init=args.carcinoma_constraint_w_init,
-    )
-    ckpt_data = torch.load(selected_ckpt, map_location=device)
-    vis_model.load_state_dict(ckpt_data['model_state_dict'], strict=False)
-    vis_model = vis_model.to(device)
-
-    if args.attention_save_path:
-        save_path = args.attention_save_path
-    else:
-        save_path = os.path.join(
-            args.ckpt_dir,
-            f"attention_last_layer_fold{selected_fold}_{args.attention_source}_idx{sample_idx}.png",
-        )
-
-    save_attention_heatmap_for_sample(
-        model=vis_model,
-        tokenizer=tokenizer,
-        clinical_text=cli_text,
-        findings_text=find_text,
-        comparative_text=comp_text,
-        max_length=args.max_length,
-        device=device,
-        save_path=save_path,
-        max_tokens=args.attention_max_tokens,
-        merge_wordpieces=args.attention_merge_wordpieces,
-    )
-    rank0_print(
-        rank,
-        f"[INFO] Saved attention heatmap from fold {selected_fold}, sample idx {sample_idx} ({args.attention_source}) to: {save_path}",
-    )
 
 
 def train_fold(
@@ -656,25 +116,14 @@ def train_fold(
                            for k, v in batch.items() if k != "labels"}
 
             with autocast('cuda', dtype=torch.float16, enabled=use_amp):
-                if constraint_is_on:
-                    outputs, constraint_w = model(
-                        clinical_input_ids=batch_device['clinical_input_ids'],
-                        clinical_attention_mask=batch_device['clinical_attention_mask'],
-                        findings_input_ids=batch_device['findings_input_ids'],
-                        findings_attention_mask=batch_device['findings_attention_mask'],
-                        comparative_input_ids=batch_device['comparative_input_ids'],
-                        comparative_attention_mask=batch_device['comparative_attention_mask'],
-                        return_constraint_weight=True,
-                    )
-                else:
-                    outputs = model(
-                        clinical_input_ids=batch_device['clinical_input_ids'],
-                        clinical_attention_mask=batch_device['clinical_attention_mask'],
-                        findings_input_ids=batch_device['findings_input_ids'],
-                        findings_attention_mask=batch_device['findings_attention_mask'],
-                        comparative_input_ids=batch_device['comparative_input_ids'],
-                        comparative_attention_mask=batch_device['comparative_attention_mask']
-                    )
+                outputs = model(
+                    clinical_input_ids=batch_device['clinical_input_ids'],
+                    clinical_attention_mask=batch_device['clinical_attention_mask'],
+                    findings_input_ids=batch_device['findings_input_ids'],
+                    findings_attention_mask=batch_device['findings_attention_mask'],
+                    comparative_input_ids=batch_device['comparative_input_ids'],
+                    comparative_attention_mask=batch_device['comparative_attention_mask']
+                )
 
                 loss = compute_classification_loss(
                     outputs,
@@ -728,18 +177,7 @@ def train_fold(
                 )
             
             avg_loss = running_loss / max(1, len(train_loader))
-            if constraint_is_on:
-                base_model = model.module if hasattr(model, 'module') else model
-                constraint_w_val = float(base_model.get_carcinoma_constraint_w().detach().item())
-                avg_constraint = running_constraint_loss / max(1, len(train_loader))
-                rank0_print(
-                    rank,
-                    f"    Epoch {epoch}/{epochs} | loss: {avg_loss:.4f} | val macro F1: {val_f1:.5f} "
-                    f"| carcinoma_w: {constraint_w_val:.6f} | carcinoma_loss: {avg_constraint:.6f} "
-                    f"| carcinoma_samples: {running_constraint_active}"
-                )
-            else:
-                rank0_print(rank, f"    Epoch {epoch}/{epochs} | loss: {avg_loss:.4f} | val macro F1: {val_f1:.5f} ")
+            rank0_print(rank, f"    Epoch {epoch}/{epochs} | loss: {avg_loss:.4f} | val macro F1: {val_f1:.5f} ")
             
             # Return to training mode after evaluation
             model.train()
@@ -888,6 +326,28 @@ def train_full_model(
 
 
 def main(args):
+    # ============ Handle txt-to-PNG regeneration mode ============
+    if args.regenerate_attention_from_txt:
+        """Quick mode: regenerate PNG from saved txt without training"""
+        txt_path = args.regenerate_attention_from_txt
+        output_png = txt_path.replace('_attention_report.txt', '.png')
+        
+        print(f"[INFO] Regenerate PNG mode activated")
+        print(f"[INPUT] txt: {txt_path}")
+        print(f"[OUTPUT] png: {output_png}")
+        
+        success = regenerate_attention_heatmap_from_txt(
+            txt_path=txt_path,
+            output_png_path=output_png,
+            max_tokens=args.attention_max_tokens
+        )
+        
+        if success:
+            print(f"[SUCCESS] PNG regenerated successfully!")
+        else:
+            print(f"[FAILED] Could not regenerate PNG from txt")
+        return
+
     # ============ Initialize Distributed Training ============
     rank, local_rank, world_size, is_distributed = setup_distributed()
     try:
@@ -1019,8 +479,7 @@ def main(args):
                     
                     va_model = TokenLevelSegmentedBert(
                         args.model_name,
-                        num_labels=num_labels,
-                        carcinoma_constraint_w_init=args.carcinoma_constraint_w_init,
+                        num_labels=num_labels
                     )
                     ckpt_data = torch.load(latest_ckpt, map_location=device)
                     va_model.load_state_dict(ckpt_data['model_state_dict'], strict=False)
@@ -1218,8 +677,7 @@ def main(args):
                     
                     test_model = TokenLevelSegmentedBert(
                         args.model_name,
-                        num_labels=num_labels,
-                        carcinoma_constraint_w_init=args.carcinoma_constraint_w_init,
+                        num_labels=num_labels
                     )
                     ckpt_data = torch.load(latest_ckpt, map_location=device)
                     test_model.load_state_dict(ckpt_data['model_state_dict'], strict=False)
@@ -1303,7 +761,6 @@ def main(args):
         oof_pred = np.empty(len(train), dtype=int)
         fold_scores = []
         best_epochs = []
-        attention_extracted_early = False
 
         # Initialize fold validation summary file
         fold_validation_summary_path = os.path.join(args.ckpt_dir, "fold_validation_summary.txt")
@@ -1337,35 +794,19 @@ def main(args):
             va_findings = X_findings[va_idx].tolist()
             va_comparative = X_comparative[va_idx].tolist()
 
-            tr_carcinoma_flags = torch.tensor([
-                int('carcinoma' in f"{'' if pd.isna(c) else str(c)} {'' if pd.isna(f) else str(f)} {'' if pd.isna(cp) else str(cp)}".lower())
-                for c, f, cp in zip(tr_clinical, tr_findings, tr_comparative)
-            ], dtype=torch.long)
-            va_carcinoma_flags = torch.tensor([
-                int('carcinoma' in f"{'' if pd.isna(c) else str(c)} {'' if pd.isna(f) else str(f)} {'' if pd.isna(cp) else str(cp)}".lower())
-                for c, f, cp in zip(va_clinical, va_findings, va_comparative)
-            ], dtype=torch.long)
-
             y_tr = torch.tensor(y[tr_idx], dtype=torch.long)
             y_va = torch.tensor(y[va_idx], dtype=torch.long)
 
             tr_enc = make_segmented_encodings(tokenizer, tr_clinical, tr_findings, tr_comparative, args.max_length)
             va_enc = make_segmented_encodings(tokenizer, va_clinical, va_findings, va_comparative, args.max_length)
 
-            tr_ds = SegmentedTextDataset(tr_enc, y_tr, carcinoma_flags=tr_carcinoma_flags)
-            va_ds = SegmentedTextDataset(va_enc, y_va, carcinoma_flags=va_carcinoma_flags)
+            tr_ds = SegmentedTextDataset(tr_enc, y_tr)
+            va_ds = SegmentedTextDataset(va_enc, y_va)
 
             # Use DistributedSampler for training
             tr_sampler = None
             if is_distributed:
-                # tr_sampler = DistributedSampler(
-                #     tr_ds,
-                #     num_replicas=world_size,
-                #     rank=rank,
-                #     shuffle=True,
-                #     seed=RANDOM_STATE + fold,
-                #     drop_last=True,
-                # )
+                
                 tr_sampler = DistributedSampler(
                     tr_ds,
                     num_replicas=world_size,
@@ -1394,8 +835,7 @@ def main(args):
 
             model = TokenLevelSegmentedBert(
                 args.model_name,
-                num_labels=num_labels,
-                carcinoma_constraint_w_init=args.carcinoma_constraint_w_init,
+                num_labels=num_labels
             )
             
             # Try to load checkpoint BEFORE wrapping with DDP
@@ -1451,8 +891,8 @@ def main(args):
                 early_stop_patience=3,
             )
 
-            # Extract attention right after the first trained fold finishes.
-            if (not attention_extracted_early) and args.extract_attention_after_train and rank == 0:
+            # Extract attention for every trained fold (regardless of previous folds)
+            if args.extract_attention_after_train and rank == 0:
                 preferred_ckpt = os.path.join(args.ckpt_dir, f"fold_{fold}_epoch_{best_epoch}.pt")
                 if not os.path.exists(preferred_ckpt):
                     pattern = os.path.join(args.ckpt_dir, f"fold_{fold}_epoch_*.pt")
@@ -1470,7 +910,6 @@ def main(args):
                     preferred_ckpt_path=preferred_ckpt if os.path.exists(preferred_ckpt) else None,
                     preferred_fold=fold,
                 )
-                attention_extracted_early = True
 
             val_f1, pred_va = distributed_evaluate(
                 model=model,
@@ -1565,8 +1004,7 @@ def main(args):
                 
                 test_model = TokenLevelSegmentedBert(
                     args.model_name,
-                    num_labels=num_labels,
-                    carcinoma_constraint_w_init=args.carcinoma_constraint_w_init,
+                    num_labels=num_labels
                 )
                 ckpt_data = torch.load(latest_ckpt, map_location=device)
                 test_model.load_state_dict(ckpt_data['model_state_dict'], strict=False)
@@ -1622,17 +1060,6 @@ def main(args):
             rank0_print(rank, f"\n[INFO] Saved submission using {len(used_folds)} folds: {sorted(used_folds)}")
             rank0_print(rank, f"[INFO] Path: {args.sub_path}")
             rank0_print(rank, submission.head())
-
-            if not attention_extracted_early:
-                maybe_extract_attention_after_run(
-                    args=args,
-                    tokenizer=tokenizer,
-                    train_df=train,
-                    test_df=test,
-                    num_labels=num_labels,
-                    device=device,
-                    rank=rank,
-                )
     
     finally:
         cleanup_distributed(is_distributed)
@@ -1652,7 +1079,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--no_data_parallel", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--n_splits", type=int, default=N_SPLITS)
     parser.add_argument(
@@ -1670,15 +1097,18 @@ if __name__ == "__main__":
     parser.add_argument("--focal_gamma", type=float, default=1.0, help="Focal loss gamma parameter")
 
     # Optional attention extraction and visualization
-    parser.add_argument("--extract_attention_after_train", action="store_true", help="After train/inference, extract last-layer attention and save heatmap")
+    parser.add_argument("--extract_attention_after_train", action="store_true", help="After train/inference, extract last-layer attention and save heatmap for each fold")
     parser.add_argument("--attention_source", type=str, default="train", choices=["train", "test"], help="Sample source for attention visualization")
     parser.add_argument("--attention_sample_index", type=int, default=0, help="Sample index in selected source dataframe")
     parser.add_argument("--attention_max_tokens", type=int, default=120, help="Maximum number of tokens to display on attention heatmap")
     parser.add_argument("--attention_merge_wordpieces", action=argparse.BooleanOptionalAction, default=True, help="Merge consecutive ## WordPiece tokens for readable labels")
     parser.add_argument("--attention_save_path", type=str, default="", help="Output image path for attention heatmap; default is ckpt_dir auto path")
     
+    # Regenerate attention from txt
+    parser.add_argument("--regenerate_attention_from_txt", type=str, default="", help="Path to txt file to regenerate PNG heatmap from")
+    
     # Checkpoint options
-    parser.add_argument("--ckpt_dir", type=str, default="spr2026/segmented_model_attention", help="Directory to save checkpoints")
+    parser.add_argument("--ckpt_dir", type=str, default="spr2026/segmented_model_attention0", help="Directory to save checkpoints")
     parser.add_argument("--resume", action="store_true", default=True, help="Resume from latest checkpoint")
 
     args, _ = parser.parse_known_args()
