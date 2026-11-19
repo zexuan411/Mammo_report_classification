@@ -1,0 +1,233 @@
+====================================================================================================
+OUT-OF-FOLD MISCLASSIFICATION SUMMARY
+====================================================================================================
+
+
+====================================================================================================
+FOLD 1 MISCLASSIFICATION ANALYSIS
+====================================================================================================
+Total samples: 4354
+Misclassified: 161
+Accuracy: 0.96302
+
+  Label 0: 149 samples, 29 errors (19.46%)
+      -> Predicted as 2: 11
+      -> Predicted as 3: 15
+      -> Predicted as 4: 2
+      -> Predicted as 6: 1
+  Label 1: 92 samples, 5 errors (5.43%)
+      -> Predicted as 2: 4
+      -> Predicted as 3: 1
+  Label 2: 3890 samples, 53 errors (1.36%)
+      -> Predicted as 0: 7
+      -> Predicted as 1: 12
+      -> Predicted as 3: 29
+      -> Predicted as 4: 4
+      -> Predicted as 6: 1
+  Label 3: 155 samples, 55 errors (35.48%)
+      -> Predicted as 0: 17
+      -> Predicted as 2: 34
+      -> Predicted as 4: 3
+      -> Predicted as 6: 1
+  Label 4: 53 samples, 17 errors (32.08%)
+      -> Predicted as 0: 4
+      -> Predicted as 2: 6
+      -> Predicted as 3: 5
+      -> Predicted as 5: 2
+  Label 5: 6 samples, 0 errors (0.00%)
+  Label 6: 9 samples, 2 errors (22.22%)
+      -> Predicted as 1: 1
+      -> Predicted as 3: 1
+
+====================================================================================================
+FOLD 2 MISCLASSIFICATION ANALYSIS
+====================================================================================================
+Total samples: 4354
+Misclassified: 190
+Accuracy: 0.95636
+
+  Label 0: 153 samples, 30 errors (19.61%)
+      -> Predicted as 2: 12
+      -> Predicted as 3: 16
+      -> Predicted as 4: 2
+  Label 1: 103 samples, 1 errors (0.97%)
+      -> Predicted as 2: 1
+  Label 2: 3862 samples, 67 errors (1.73%)
+      -> Predicted as 0: 15
+      -> Predicted as 1: 11
+      -> Predicted as 3: 32
+      -> Predicted as 4: 8
+      -> Predicted as 5: 1
+  Label 3: 171 samples, 72 errors (42.11%)
+      -> Predicted as 0: 21
+      -> Predicted as 1: 1
+      -> Predicted as 2: 43
+      -> Predicted as 4: 7
+  Label 4: 47 samples, 13 errors (27.66%)
+      -> Predicted as 0: 3
+      -> Predicted as 1: 1
+      -> Predicted as 2: 3
+      -> Predicted as 3: 1
+      -> Predicted as 5: 4
+      -> Predicted as 6: 1
+  Label 5: 9 samples, 5 errors (55.56%)
+      -> Predicted as 2: 1
+      -> Predicted as 4: 4
+  Label 6: 9 samples, 2 errors (22.22%)
+      -> Predicted as 2: 1
+      -> Predicted as 4: 1
+
+====================================================================================================
+FOLD 3 MISCLASSIFICATION ANALYSIS
+====================================================================================================
+Total samples: 4354
+Misclassified: 186
+Accuracy: 0.95728
+
+  Label 0: 127 samples, 16 errors (12.60%)
+      -> Predicted as 2: 9
+      -> Predicted as 3: 2
+      -> Predicted as 4: 5
+  Label 1: 165 samples, 4 errors (2.42%)
+      -> Predicted as 2: 4
+  Label 2: 3811 samples, 82 errors (2.15%)
+      -> Predicted as 0: 21
+      -> Predicted as 1: 12
+      -> Predicted as 3: 42
+      -> Predicted as 4: 5
+      -> Predicted as 5: 1
+      -> Predicted as 6: 1
+  Label 3: 184 samples, 63 errors (34.24%)
+      -> Predicted as 0: 30
+      -> Predicted as 2: 29
+      -> Predicted as 4: 4
+  Label 4: 45 samples, 11 errors (24.44%)
+      -> Predicted as 0: 3
+      -> Predicted as 2: 2
+      -> Predicted as 3: 6
+  Label 5: 7 samples, 4 errors (57.14%)
+      -> Predicted as 3: 1
+      -> Predicted as 4: 3
+  Label 6: 15 samples, 6 errors (40.00%)
+      -> Predicted as 0: 2
+      -> Predicted as 2: 1
+      -> Predicted as 4: 3
+
+====================================================================================================
+FOLD 4 MISCLASSIFICATION ANALYSIS
+====================================================================================================
+Total samples: 4354
+Misclassified: 185
+Accuracy: 0.95751
+
+  Label 0: 137 samples, 32 errors (23.36%)
+      -> Predicted as 2: 14
+      -> Predicted as 3: 15
+      -> Predicted as 4: 3
+  Label 1: 374 samples, 5 errors (1.34%)
+      -> Predicted as 2: 4
+      -> Predicted as 3: 1
+  Label 2: 3604 samples, 72 errors (2.00%)
+      -> Predicted as 0: 7
+      -> Predicted as 1: 20
+      -> Predicted as 3: 44
+      -> Predicted as 4: 1
+  Label 3: 158 samples, 50 errors (31.65%)
+      -> Predicted as 0: 13
+      -> Predicted as 2: 35
+      -> Predicted as 4: 2
+  Label 4: 65 samples, 23 errors (35.38%)
+      -> Predicted as 2: 9
+      -> Predicted as 3: 9
+      -> Predicted as 5: 3
+      -> Predicted as 6: 2
+  Label 5: 4 samples, 1 errors (25.00%)
+      -> Predicted as 2: 1
+  Label 6: 12 samples, 2 errors (16.67%)
+      -> Predicted as 0: 1
+      -> Predicted as 4: 1
+
+====================================================================================================
+FOLD 5 MISCLASSIFICATION ANALYSIS
+====================================================================================================
+Total samples: 4354
+Misclassified: 195
+Accuracy: 0.95521
+
+  Label 0: 167 samples, 32 errors (19.16%)
+      -> Predicted as 1: 1
+      -> Predicted as 2: 9
+      -> Predicted as 3: 16
+      -> Predicted as 4: 6
+  Label 1: 102 samples, 4 errors (3.92%)
+      -> Predicted as 2: 4
+  Label 2: 3847 samples, 85 errors (2.21%)
+      -> Predicted as 0: 11
+      -> Predicted as 1: 17
+      -> Predicted as 3: 53
+      -> Predicted as 4: 3
+      -> Predicted as 6: 1
+  Label 3: 172 samples, 57 errors (33.14%)
+      -> Predicted as 0: 24
+      -> Predicted as 2: 28
+      -> Predicted as 4: 5
+  Label 4: 48 samples, 13 errors (27.08%)
+      -> Predicted as 0: 1
+      -> Predicted as 2: 2
+      -> Predicted as 3: 8
+      -> Predicted as 5: 1
+      -> Predicted as 6: 1
+  Label 5: 7 samples, 2 errors (28.57%)
+      -> Predicted as 4: 2
+  Label 6: 11 samples, 2 errors (18.18%)
+      -> Predicted as 2: 1
+      -> Predicted as 4: 1
+
+====================================================================================================
+OVERALL OUT-OF-FOLD MISCLASSIFICATION SUMMARY
+====================================================================================================
+Total samples: 21770
+Total misclassified: 917
+Overall accuracy: 0.95788
+Overall macro F1: 0.78414
+
+Error Statistics by True Class:
+  Label 0: 733 samples, 139 errors (18.96%)
+      -> Predicted as 1: 1
+      -> Predicted as 2: 55
+      -> Predicted as 3: 64
+      -> Predicted as 4: 18
+      -> Predicted as 6: 1
+  Label 1: 836 samples, 19 errors (2.27%)
+      -> Predicted as 2: 17
+      -> Predicted as 3: 2
+  Label 2: 19014 samples, 359 errors (1.89%)
+      -> Predicted as 0: 61
+      -> Predicted as 1: 72
+      -> Predicted as 3: 200
+      -> Predicted as 4: 21
+      -> Predicted as 5: 2
+      -> Predicted as 6: 3
+  Label 3: 840 samples, 297 errors (35.36%)
+      -> Predicted as 0: 105
+      -> Predicted as 1: 1
+      -> Predicted as 2: 169
+      -> Predicted as 4: 21
+      -> Predicted as 6: 1
+  Label 4: 258 samples, 77 errors (29.84%)
+      -> Predicted as 0: 11
+      -> Predicted as 1: 1
+      -> Predicted as 2: 22
+      -> Predicted as 3: 29
+      -> Predicted as 5: 10
+      -> Predicted as 6: 4
+  Label 5: 33 samples, 12 errors (36.36%)
+      -> Predicted as 2: 2
+      -> Predicted as 3: 1
+      -> Predicted as 4: 9
+  Label 6: 56 samples, 14 errors (25.00%)
+      -> Predicted as 0: 3
+      -> Predicted as 1: 1
+      -> Predicted as 2: 3
+      -> Predicted as 3: 1
+      -> Predicted as 4: 6
