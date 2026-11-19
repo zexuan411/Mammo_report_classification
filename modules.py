@@ -9,7 +9,8 @@ import pandas as pd
 import glob
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Subset
 from torch.amp import autocast, GradScaler
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import f1_score, classification_report
@@ -84,9 +85,12 @@ def maybe_parallelize(model, device, use_data_parallel=True):
 def save_checkpoint(model, optimizer, scheduler, epoch, fold, best_f1, ckpt_dir):
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"fold_{fold}_epoch_{epoch}.pt")
-    
-    model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
-    
+
+    # Strip DP/DDP wrapper so checkpoints stay portable across single-GPU / DP / DDP.
+    while isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+        model = model.module
+    model_state = model.state_dict()
+
     checkpoint = {
         "epoch": epoch,
         "fold": fold,
@@ -180,9 +184,28 @@ def make_encodings(tokenizer, texts, max_length):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, use_ordinal=False, use_amp=False, amp_dtype=torch.float16):
+def evaluate(
+    model,
+    loader,
+    device,
+    use_ordinal=False,
+    use_amp=False,
+    amp_dtype=torch.float16,
+    return_both_decodes=False,
+    use_hard_cascade=False,
+    cascade_tau=0.5,
+    hier_zero_label=0,
+):
+    """Evaluate macro F1.
+
+    By default returns (f1, preds) for the selected decode mode.
+    If return_both_decodes=True, returns
+    (f1_primary, preds_primary, f1_argmax, f1_ordinal).
+    """
     model.eval()
-    preds = []
+    preds_argmax = []
+    preds_ordinal = []
+    preds_hard = []
     trues = []
 
     for batch in loader:
@@ -190,101 +213,206 @@ def evaluate(model, loader, device, use_ordinal=False, use_amp=False, amp_dtype=
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-        with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            
-            if use_ordinal:
-                # For ordinal loss: sum of sigmoid predictions across binary classifiers
-                # If sum >= k, predict class k
-                ordinal_logits = outputs.logits[:, :-1]  # Use first K-1 outputs
-                ordinal_probs = torch.sigmoid(ordinal_logits)  # Convert to probabilities
-                # Count how many classifiers predict >= 0.5
-                pred = torch.sum(ordinal_probs >= 0.5, dim=1).long()
-                # Clip to valid range [0, num_classes-1]
-                pred = torch.clamp(pred, 0, outputs.logits.size(1) - 1)
-            else:
-                # Standard cross entropy: argmax
-                pred = torch.argmax(outputs.logits, dim=-1)
+            logits = outputs.logits
 
-        preds.extend(pred.cpu().numpy().tolist())
+            pred_argmax = torch.argmax(logits, dim=-1)
+
+            # Dual-head models expose a dedicated ordinal head; otherwise use first K-1 logits.
+            if getattr(outputs, "ordinal_logits", None) is not None:
+                ordinal_logits = outputs.ordinal_logits
+                max_class = logits.size(1) - 1
+            else:
+                ordinal_logits = logits[:, :-1]
+                max_class = logits.size(1) - 1
+            ordinal_probs = torch.sigmoid(ordinal_logits)
+            pred_ordinal = torch.sum(ordinal_probs >= 0.5, dim=1).long()
+            pred_ordinal = torch.clamp(pred_ordinal, 0, max_class)
+
+            if use_hard_cascade and getattr(outputs, "binary_logits", None) is not None:
+                pred_hard = hard_cascade_from_outputs(
+                    outputs, tau=cascade_tau, zero_label=hier_zero_label
+                )
+            else:
+                pred_hard = pred_argmax
+
+        preds_argmax.extend(pred_argmax.cpu().numpy().tolist())
+        preds_ordinal.extend(pred_ordinal.cpu().numpy().tolist())
+        preds_hard.extend(pred_hard.cpu().numpy().tolist())
         trues.extend(labels.cpu().numpy().tolist())
 
-    return f1_score(trues, preds, average="macro"), np.array(preds, dtype=int)
+    f1_argmax = f1_score(trues, preds_argmax, average="macro")
+    f1_ordinal = f1_score(trues, preds_ordinal, average="macro")
+    f1_hard = f1_score(trues, preds_hard, average="macro")
+    if use_hard_cascade:
+        f1_primary, preds_primary = f1_hard, np.array(preds_hard, dtype=int)
+    elif use_ordinal:
+        f1_primary, preds_primary = f1_ordinal, np.array(preds_ordinal, dtype=int)
+    else:
+        f1_primary, preds_primary = f1_argmax, np.array(preds_argmax, dtype=int)
+
+    if return_both_decodes:
+        return f1_primary, preds_primary, f1_argmax, f1_ordinal
+    return f1_primary, preds_primary
 
 
 @torch.no_grad()
-def distributed_evaluate(model, dataset, device, batch_size, num_workers, is_distributed, rank, world_size):
+def extract_ce_logits(outputs):
+    """Support both plain logit tensors and DualHeadOutput-like objects."""
+    if hasattr(outputs, "logits"):
+        return outputs.logits
+    return outputs
+
+
+def logits_to_ordinal_class(logits_or_ordinal, num_classes=None):
+    """
+    Decode ordinal threshold logits to a class index.
+    If a full K-way tensor is passed, use the first K-1 columns.
+    """
+    if num_classes is None:
+        # shared K-way logits -> thresholds are first K-1
+        ordinal_logits = logits_or_ordinal[:, :-1]
+        max_class = logits_or_ordinal.size(1) - 1
+    else:
+        ordinal_logits = logits_or_ordinal
+        max_class = num_classes - 1
+    ordinal_probs = torch.sigmoid(ordinal_logits)
+    pred = torch.sum(ordinal_probs >= 0.5, dim=1).long()
+    return torch.clamp(pred, 0, max_class)
+
+
+def hard_cascade_from_outputs(outputs, tau=0.5, zero_label=0):
+    """
+    Hard cascade decode for hierarchical BI-RADS heads:
+      if sigmoid(binary) >= tau -> zero_label
+      else -> ordinal remapped class mapped back around zero_label
+    Assumes zero_label=0 and ordinal head has (K-2) thresholds.
+    """
+    binary_logits = getattr(outputs, "binary_logits", None)
+    ordinal_logits = getattr(outputs, "ordinal_logits", None)
+    if binary_logits is None or ordinal_logits is None:
+        raise ValueError("hard cascade requires binary_logits and ordinal_logits")
+    if int(zero_label) != 0:
+        raise ValueError("hard_cascade_from_outputs currently supports zero_label=0 only")
+    if binary_logits.ndim > 1:
+        binary_logits = binary_logits.squeeze(-1)
+    p0 = torch.sigmoid(binary_logits.float())
+    n_diag = ordinal_logits.size(1) + 1  # remapped diagnostic classes
+    ord_remapped = logits_to_ordinal_class(ordinal_logits, num_classes=n_diag)
+    ord_label = ord_remapped + 1  # map 0..K-2 -> labels 1..K-1
+    return torch.where(p0 >= float(tau), torch.zeros_like(ord_label), ord_label)
+
+
+def distributed_evaluate(
+    model,
+    dataset,
+    device,
+    batch_size,
+    num_workers,
+    is_distributed,
+    rank,
+    world_size,
+    use_ordinal=False,
+    use_hard_cascade=False,
+    cascade_tau=0.5,
+    hier_zero_label=0,
+):
     """Evaluate on all ranks by partitioning dataset and aggregating predictions."""
+
+    def _predict_batch(outputs):
+        if use_hard_cascade:
+            return hard_cascade_from_outputs(
+                outputs, tau=cascade_tau, zero_label=hier_zero_label
+            )
+        ce_logits = extract_ce_logits(outputs)
+        if use_ordinal:
+            ordinal_logits = getattr(outputs, "ordinal_logits", None)
+            if ordinal_logits is not None:
+                return logits_to_ordinal_class(ordinal_logits, num_classes=ce_logits.size(1))
+            return logits_to_ordinal_class(ce_logits)
+        return torch.argmax(ce_logits, dim=-1)
+
+    # Unwrap DDP: eval must not run reducer collectives (uneven shard sizes desync ranks).
+    eval_model = model.module if hasattr(model, "module") else model
+    # DataLoader workers + CUDA/NCCL under DDP are a common hang source.
+    eval_workers = 0 if is_distributed else num_workers
+
     if not is_distributed:
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=eval_workers,
             pin_memory=torch.cuda.is_available(),
-            persistent_workers=num_workers > 0,
+            persistent_workers=eval_workers > 0,
         )
         preds = []
         trues = []
-        model.eval()
-        for batch in loader:
-            labels = batch.get("labels")
-            batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                           for k, v in batch.items()}
-            
-            outputs = model(
-                clinical_input_ids=batch_device['clinical_input_ids'],
-                clinical_attention_mask=batch_device['clinical_attention_mask'],
-                findings_input_ids=batch_device['findings_input_ids'],
-                findings_attention_mask=batch_device['findings_attention_mask'],
-                comparative_input_ids=batch_device['comparative_input_ids'],
-                comparative_attention_mask=batch_device['comparative_attention_mask']
-            )
-            pred = torch.argmax(outputs, dim=-1)
-            preds.extend(pred.cpu().numpy().tolist())
-            if labels is not None:
-                trues.extend(labels.cpu().numpy().tolist())
-        
+        eval_model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                labels = batch.get("labels")
+                batch_device = {
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+
+                outputs = eval_model(
+                    clinical_input_ids=batch_device["clinical_input_ids"],
+                    clinical_attention_mask=batch_device["clinical_attention_mask"],
+                    findings_input_ids=batch_device["findings_input_ids"],
+                    findings_attention_mask=batch_device["findings_attention_mask"],
+                    comparative_input_ids=batch_device["comparative_input_ids"],
+                    comparative_attention_mask=batch_device["comparative_attention_mask"],
+                )
+                pred = _predict_batch(outputs)
+                preds.extend(pred.cpu().numpy().tolist())
+                if labels is not None:
+                    trues.extend(labels.cpu().numpy().tolist())
+
         if trues:
             val_f1 = float(f1_score(trues, preds, average="macro"))
             return val_f1, np.array(preds)
-        else:
-            return 0.0, np.array(preds)
+        return 0.0, np.array(preds)
 
-    model.eval()
+    eval_model.eval()
     local_indices = np.arange(len(dataset))[rank::world_size]
     local_subset = Subset(dataset, local_indices.tolist())
     local_loader = DataLoader(
         local_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=eval_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
     )
 
     local_preds = []
     local_trues = []
 
-    for batch in local_loader:
-        labels = batch.get("labels")
-        batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                       for k, v in batch.items()}
-        
-        outputs = model(
-            clinical_input_ids=batch_device['clinical_input_ids'],
-            clinical_attention_mask=batch_device['clinical_attention_mask'],
-            findings_input_ids=batch_device['findings_input_ids'],
-            findings_attention_mask=batch_device['findings_attention_mask'],
-            comparative_input_ids=batch_device['comparative_input_ids'],
-            comparative_attention_mask=batch_device['comparative_attention_mask']
-        )
-        pred = torch.argmax(outputs, dim=-1)
+    with torch.no_grad():
+        for batch in local_loader:
+            labels = batch.get("labels")
+            batch_device = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
-        local_preds.extend(pred.cpu().numpy().tolist())
-        if labels is not None:
-            local_trues.extend(labels.cpu().numpy().tolist())
+            outputs = eval_model(
+                clinical_input_ids=batch_device["clinical_input_ids"],
+                clinical_attention_mask=batch_device["clinical_attention_mask"],
+                findings_input_ids=batch_device["findings_input_ids"],
+                findings_attention_mask=batch_device["findings_attention_mask"],
+                comparative_input_ids=batch_device["comparative_input_ids"],
+                comparative_attention_mask=batch_device["comparative_attention_mask"],
+            )
+            pred = _predict_batch(outputs)
 
+            local_preds.extend(pred.cpu().numpy().tolist())
+            if labels is not None:
+                local_trues.extend(labels.cpu().numpy().tolist())
+
+    dist.barrier()
     gathered = [None for _ in range(world_size)]
     dist.all_gather_object(gathered, (local_indices.tolist(), local_preds, local_trues))
 
@@ -297,7 +425,7 @@ def distributed_evaluate(model, dataset, device, batch_size, num_workers, is_dis
             if idxs:
                 pred_full[idxs] = np.array(preds)
                 true_full[idxs] = np.array(trues)
-        
+
         if true_full.size > 0:
             val_f1 = float(f1_score(true_full, pred_full, average="macro"))
 
@@ -315,8 +443,15 @@ def save_confusion_matrix_as_table(cm, id2label, save_path):
 
 def save_classification_report_as_table(y_true, y_pred, id2label, save_path):
     """Save classification report as CSV table."""
-    label_names = [str(id2label[i]) for i in range(len(id2label))]
-    report_dict = classification_report(y_true, y_pred, target_names=label_names, output_dict=True)
+    label_ids = list(range(len(id2label)))
+    label_names = [str(id2label[i]) for i in label_ids]
+    report_dict = classification_report(
+        y_true, y_pred,
+        labels=label_ids,
+        target_names=label_names,
+        output_dict=True,
+        zero_division=0,
+    )
     report_df = pd.DataFrame(report_dict).transpose()
     report_df.to_csv(save_path)
 
@@ -365,8 +500,6 @@ def _build_attention_token_labels_and_indices(tokenizer, cli_ids, cli_mask, find
     labels = ["[G_CLS]"]
     keep_indices = [0]
 
-    seg_len = int(cli_ids.numel())
-
     def _append_segment(input_ids, attention_mask, prefix, base_offset):
         nonlocal labels, keep_indices
         valid_pos = torch.nonzero(attention_mask > 0, as_tuple=False).squeeze(-1).tolist()
@@ -381,9 +514,12 @@ def _build_attention_token_labels_and_indices(tokenizer, cli_ids, cli_mask, find
         keep_indices.extend([base_offset + int(p) for p in valid_pos])
 
     # +1 offset because index 0 is global CLS prepended before concatenated segment tokens.
+    # Segment lengths may differ (e.g. clinical=40, findings=160, comparative=40).
+    cli_len = int(cli_ids.numel())
+    find_len = int(find_ids.numel())
     _append_segment(cli_ids, cli_mask, "CLI", base_offset=1)
-    _append_segment(find_ids, find_mask, "FIND", base_offset=1 + seg_len)
-    _append_segment(comp_ids, comp_mask, "COMP", base_offset=1 + 2 * seg_len)
+    _append_segment(find_ids, find_mask, "FIND", base_offset=1 + cli_len)
+    _append_segment(comp_ids, comp_mask, "COMP", base_offset=1 + cli_len + find_len)
 
     return labels, keep_indices
 
@@ -457,6 +593,9 @@ def save_attention_heatmap_for_sample(
     merge_wordpieces=True,
 ):
     """Extract last-layer attention (first sample) and save heatmap with token labels."""
+    import matplotlib.pyplot as plt
+    from data_segmentation import make_segmented_encodings
+
     model.eval()
 
     enc_list = make_segmented_encodings(
@@ -718,6 +857,7 @@ def regenerate_attention_heatmap_from_txt(txt_path, output_png_path, max_tokens=
     """
     import json
     from io import StringIO
+    import matplotlib.pyplot as plt
     
     rank0_print(0, f"[INFO] Regenerating heatmap from txt: {txt_path}")
     
@@ -796,6 +936,8 @@ def maybe_extract_attention_after_run(
     if not args.extract_attention_after_train or rank != 0:
         return
 
+    from data_segmentation import TokenLevelSegmentedBert, split_report_by_sections
+
     selected_fold = None
     selected_ckpt = None
 
@@ -853,13 +995,20 @@ def maybe_extract_attention_after_run(
             f"attention_last_layer_fold{selected_fold}_{args.attention_source}_idx{sample_idx}.png",
         )
 
+    attn_max_length = getattr(args, "max_length", None)
+    if attn_max_length is None:
+        attn_max_length = max(
+            int(getattr(args, "clinical_max_length", 256)),
+            int(getattr(args, "findings_max_length", 256)),
+            int(getattr(args, "comparative_max_length", 256)),
+        )
     save_attention_heatmap_for_sample(
         model=vis_model,
         tokenizer=tokenizer,
         clinical_text=cli_text,
         findings_text=find_text,
         comparative_text=comp_text,
-        max_length=args.max_length,
+        max_length=attn_max_length,
         device=device,
         save_path=save_path,
         max_tokens=args.attention_max_tokens,

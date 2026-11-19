@@ -1,5 +1,7 @@
 import pandas as pd
 import re
+from typing import NamedTuple, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,7 +48,7 @@ def split_report_by_sections(report):
             clinical_idx = idx
             break
     
-    # 寻找 findings 的起始位置
+    # Find findings start index
     findings_idx = -1
     findings_variants = ['achados', 'descrição do exame', 'análise', 'chados']
     for variant in findings_variants:
@@ -55,14 +57,14 @@ def split_report_by_sections(report):
             findings_idx = idx
             break
     
-    # 寻找 comparative analysis 的起始位置
+    # Find comparative analysis start index
     comparative_idx = report_lower.find('análise comparativa')
     
-    # ============ 提取 clinical indication ============
+    # ============ Extract clinical indication ============
     if clinical_idx != -1:
         colon_idx = report.find(':', clinical_idx)
         if colon_idx != -1:
-            # clinical indication 从 ":" 后开始
+            # clinical indication starts after ":"
             if findings_idx != -1 and findings_idx > colon_idx:
                 sections['clinical_indication'] = report[colon_idx+1:findings_idx].strip()
             elif comparative_idx != -1 and comparative_idx > colon_idx:
@@ -70,27 +72,27 @@ def split_report_by_sections(report):
             else:
                 sections['clinical_indication'] = report[colon_idx+1:].strip()
     
-    # ============ 提取 findings ============
-    # 情况1: 有明确的 "Achados:" 标签
+    # ============ Extract findings ============
+    # Case 1: explicit "Achados:" label
     if findings_idx != -1:
         colon_idx = report.find(':', findings_idx)
         if colon_idx != -1:
-            # findings 从 ":" 后开始
+            # findings start after ":"
             if comparative_idx != -1 and comparative_idx > colon_idx:
                 sections['findings'] = report[colon_idx+1:comparative_idx].strip()
             else:
                 sections['findings'] = report[colon_idx+1:].strip()
         else:
-            # 没有 ":", 直接从标题后开始
+            # No ":", start right after the heading
             if comparative_idx != -1 and comparative_idx > findings_idx:
                 sections['findings'] = report[findings_idx:comparative_idx].strip()
             else:
                 sections['findings'] = report[findings_idx:].strip()
-    # 情况2: 没有明确的 "Achados:" 标签，从 clinical indication 的第一个"."之后开始
+    # Case 2: no "Achados:" label; start after first "." of clinical indication
     elif clinical_idx != -1:
         colon_idx = report.find(':', clinical_idx)
         if colon_idx != -1:
-            # 从 clinical indication 的第一个"."后开始作为 findings
+            # Use text after the first "." of clinical indication as findings
             dot_idx = report.find('.', colon_idx)
             if dot_idx != -1:
                 if comparative_idx != -1 and comparative_idx > dot_idx:
@@ -98,7 +100,7 @@ def split_report_by_sections(report):
                 else:
                     sections['findings'] = report[dot_idx+1:].strip()
     
-    # ============ 提取 comparative analysis ============
+    # ============ Extract comparative analysis ============
     if comparative_idx != -1:
         colon_idx = report.find(':', comparative_idx)
         if colon_idx != -1:
@@ -106,16 +108,29 @@ def split_report_by_sections(report):
         else:
             sections['comparative_analysis'] = report[comparative_idx:].strip()
     
-    # ============ 清理每个部分 ============
+    # ============ Clean each section ============
     for key in sections:
         text = sections[key]
-        # 移除任何可能的标题残留（例如 "Indicação clínica:"）
+        # Remove residual section titles (e.g. "Indicação clínica:")
         text = re.sub(r'^[^:]*:\s*', '', text, count=1)
         text = re.sub(r'\s+', ' ', text).strip()
         text = re.sub(r"([.,:;!?])([.,:;!?])+", r"\1", text)
         sections[key] = text
     
     return sections
+
+
+class DualHeadOutput(NamedTuple):
+    """CE / hierarchical logits + optional ordinal (+ binary) heads, matching bertori.py.
+
+    NamedTuple so DDP ``find_unused_parameters`` can recurse into the returned
+    tensors. A plain class is invisible to ``_find_tensors``, which marks
+    ``ordinal_classifier`` unused and then ready again on backward.
+    """
+
+    logits: torch.Tensor
+    ordinal_logits: Optional[torch.Tensor] = None
+    binary_logits: Optional[torch.Tensor] = None
 
 
 class TokenLevelSegmentedBert(nn.Module):
@@ -125,8 +140,16 @@ class TokenLevelSegmentedBert(nn.Module):
                  dropout_rate=0.1,
                  transformer_layers=1,
                  nhead=4,
-                 carcinoma_constraint_w_init=0.1):
+                 dual_head=False,
+                 no_segment_fusion=False):
         super(TokenLevelSegmentedBert, self).__init__()
+
+        if num_labels < 2 and dual_head:
+            raise ValueError("dual_head requires num_labels >= 2")
+
+        self.num_labels = num_labels
+        self.dual_head = bool(dual_head)
+        self.no_segment_fusion = bool(no_segment_fusion)
 
         # --- BERT backbone ---
         self.bert = AutoModel.from_pretrained(model_name)
@@ -137,7 +160,7 @@ class TokenLevelSegmentedBert(nn.Module):
         # --- Segment embeddings ---
         self.segment_embed = nn.Embedding(3, proj_size)
 
-        #  动态段落权重（gating）
+        # Dynamic segment gating
         self.segment_gate = nn.Linear(proj_size, 1)
         nn.init.xavier_uniform_(self.segment_gate.weight)
         nn.init.zeros_(self.segment_gate.bias)
@@ -165,13 +188,12 @@ class TokenLevelSegmentedBert(nn.Module):
         nn.init.xavier_uniform_(self.attn_pool.weight)
         nn.init.zeros_(self.attn_pool.bias)
 
-        # --- Classifier ---
+        # --- Classifier (CE head); optional ordinal aux head like bertori DualHead ---
         self.dropout = nn.Dropout(dropout_rate)
         self.classifier = nn.Linear(proj_size, num_labels)
-
-        # Learnable non-negative weight (via softplus) for optional carcinoma logit constraint loss.
-        w_init = max(float(carcinoma_constraint_w_init), 1e-6)
-        raw_init = np.log(np.expm1(w_init))
+        self.ordinal_classifier = (
+            nn.Linear(proj_size, num_labels - 1) if self.dual_head else None
+        )
 
     def _run_transformer_and_capture_last_attn(self, x):
         """
@@ -226,7 +248,6 @@ class TokenLevelSegmentedBert(nn.Module):
                 clinical_input_ids, clinical_attention_mask,
                 findings_input_ids, findings_attention_mask,
                 comparative_input_ids, comparative_attention_mask,
-                return_constraint_weight=False,
                 return_last_layer_attn=False):
 
         batch_size = clinical_input_ids.size(0)
@@ -252,18 +273,221 @@ class TokenLevelSegmentedBert(nn.Module):
         findings_proj = self.proj(findings_tokens)
         comparative_proj = self.proj(comparative_tokens)
 
+        if self.no_segment_fusion:
+            # --- Ablation: skip segment embed / gating / transformer / attn pool ---
+            # Use CLS token ([0]) from each projected segment, then mean-pool
+            final_repr = (clinical_proj[:, 0] + findings_proj[:, 0] + comparative_proj[:, 0]) / 3.0
+            last_layer_attn = None
+        else:
+            # ===== 3. Segment embedding =====
+            clinical_proj = clinical_proj + self.segment_embed(torch.zeros_like(clinical_input_ids))
+            findings_proj = findings_proj + self.segment_embed(torch.ones_like(findings_input_ids))
+            comparative_proj = comparative_proj + self.segment_embed(torch.ones_like(comparative_input_ids) * 2)
+
+            # ===== 4. Dynamic segment weights =====
+            clinical_vec = clinical_proj.mean(dim=1)
+            findings_vec = findings_proj.mean(dim=1)
+            comparative_vec = comparative_proj.mean(dim=1)
+
+            segment_scores = torch.cat([
+                self.segment_gate(clinical_vec),
+                self.segment_gate(findings_vec),
+                self.segment_gate(comparative_vec)
+            ], dim=1)
+
+            segment_weights = torch.softmax(segment_scores, dim=1)
+
+            w1 = segment_weights[:, 0].unsqueeze(-1).unsqueeze(-1)
+            w2 = segment_weights[:, 1].unsqueeze(-1).unsqueeze(-1)
+            w3 = segment_weights[:, 2].unsqueeze(-1).unsqueeze(-1)
+
+            clinical_proj = clinical_proj * w1
+            findings_proj = findings_proj * w2
+            comparative_proj = comparative_proj * w3
+
+            # ===== 5. Concatenate tokens =====
+            x = torch.cat([clinical_proj, findings_proj, comparative_proj], dim=1)
+
+            # ===== 6. Add Global CLS =====
+            cls_token = self.global_cls.expand(batch_size, -1, -1)
+            x = torch.cat([cls_token, x], dim=1)
+
+            # ===== 7. Transformer =====
+            x = x.permute(1, 0, 2)
+            if return_last_layer_attn:
+                x, last_layer_attn = self._run_transformer_and_capture_last_attn(x)
+            else:
+                x = self.cross_transformer(x)
+                last_layer_attn = None
+
+            # ===== 8. CLS + token =====
+            cls_output = x[0]
+            token_output = x[1:]
+
+            # ===== 9. Attention pooling =====
+            attn_scores = self.attn_pool(token_output)
+            attn_weights = torch.softmax(attn_scores, dim=0)
+            attn_pooled = (token_output * attn_weights).sum(dim=0)
+
+            final_repr = cls_output + attn_pooled
+        # dropped = self.dropout(final_repr)
+        logits = self.classifier(final_repr)
+        if self.dual_head:
+            outputs = DualHeadOutput(
+                logits=logits,
+                ordinal_logits=self.ordinal_classifier(final_repr),
+            )
+        else:
+            outputs = logits
+
+        if return_last_layer_attn:
+            return outputs, last_layer_attn
+        return outputs
+
+# seperete projection
+
+class TokenLevelSegmentedBert1(nn.Module):
+    def __init__(self, model_name, num_labels,
+                 hidden_size=768,
+                 proj_size=384,
+                 dropout_rate=0.1,
+                 transformer_layers=1,
+                 nhead=4):
+        super(TokenLevelSegmentedBert, self).__init__()
+
+        # --- BERT backbone (Shared) ---
+        self.bert = AutoModel.from_pretrained(model_name)
+
+        # --- Separate Projection layers ---
+        self.clinical_proj_layer = nn.Linear(hidden_size, proj_size)
+        self.findings_proj_layer = nn.Linear(hidden_size, proj_size)
+        self.comparative_proj_layer = nn.Linear(hidden_size, proj_size)
+
+        # --- Segment embeddings ---
+        self.segment_embed = nn.Embedding(3, proj_size)
+
+        # Dynamic segment gating
+        self.segment_gate = nn.Linear(proj_size, 1)
+        nn.init.xavier_uniform_(self.segment_gate.weight)
+        nn.init.zeros_(self.segment_gate.bias)
+
+        # --- Global CLS ---
+        self.global_cls = nn.Parameter(
+            torch.empty(1, 1, proj_size).normal_(std=np.sqrt(1. / proj_size))
+        )
+
+        # --- Transformer ---
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=proj_size,
+            nhead=nhead,
+            dim_feedforward=proj_size * 2,
+            dropout=dropout_rate,
+            activation='relu'
+        )
+        self.cross_transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=transformer_layers
+        )
+
+        # --- Attention pooling ---
+        self.attn_pool = nn.Linear(proj_size, 1)
+        nn.init.xavier_uniform_(self.attn_pool.weight)
+        nn.init.zeros_(self.attn_pool.bias)
+
+        # --- Classifier ---
+        self.dropout = nn.Dropout(dropout_rate)
+        self.classifier = nn.Linear(proj_size, num_labels)
+
+    def _run_transformer_and_capture_last_attn(self, x):
+        """
+        Run TransformerEncoder while capturing self-attention weights from the last layer.
+        x shape: (seq_len, batch, dim)
+        Returns:
+            x_out: (seq_len, batch, dim)
+            last_attn_weights: (batch, heads, seq_len, seq_len) or None
+        """
+        if len(self.cross_transformer.layers) == 0:
+            return x, None
+
+        last_attn_weights = None
+        for i, layer in enumerate(self.cross_transformer.layers):
+            is_last = (i == len(self.cross_transformer.layers) - 1)
+            if not is_last:
+                x = layer(x)
+                continue
+
+            if layer.norm_first:
+                x_norm = layer.norm1(x)
+                sa_out, last_attn_weights = layer.self_attn(
+                    x_norm,
+                    x_norm,
+                    x_norm,
+                    attn_mask=None,
+                    key_padding_mask=None,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )
+                x = x + layer.dropout1(sa_out)
+                x = x + layer._ff_block(layer.norm2(x))
+            else:
+                sa_out, last_attn_weights = layer.self_attn(
+                    x,
+                    x,
+                    x,
+                    attn_mask=None,
+                    key_padding_mask=None,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )
+                x = layer.norm1(x + layer.dropout1(sa_out))
+                x = layer.norm2(x + layer._ff_block(x))
+
+        if self.cross_transformer.norm is not None:
+            x = self.cross_transformer.norm(x)
+
+        return x, last_attn_weights
+
+    def forward(self,
+                clinical_input_ids, clinical_attention_mask,
+                findings_input_ids, findings_attention_mask,
+                comparative_input_ids, comparative_attention_mask,
+                return_last_layer_attn=False):
+
+        batch_size = clinical_input_ids.size(0)
+
+        # ===== 1. BERT encoding =====
+        clinical_tokens = self.bert(
+            clinical_input_ids,
+            attention_mask=clinical_attention_mask
+        ).last_hidden_state
+
+        findings_tokens = self.bert(
+            findings_input_ids,
+            attention_mask=findings_attention_mask
+        ).last_hidden_state
+
+        comparative_tokens = self.bert(
+            comparative_input_ids,
+            attention_mask=comparative_attention_mask
+        ).last_hidden_state
+
+        # ===== 2. Projection (Separate for each segment) =====
+        clinical_proj = self.clinical_proj_layer(clinical_tokens)
+        findings_proj = self.findings_proj_layer(findings_tokens)
+        comparative_proj = self.comparative_proj_layer(comparative_tokens)
+
         # ===== 3. Segment embedding =====
         clinical_proj = clinical_proj + self.segment_embed(torch.zeros_like(clinical_input_ids))
         findings_proj = findings_proj + self.segment_embed(torch.ones_like(findings_input_ids))
         comparative_proj = comparative_proj + self.segment_embed(torch.ones_like(comparative_input_ids) * 2)
 
-        # ===== 4. 动态段落权重 =====
-        # (1) 先得到每段 representation（mean pooling）
+        # ===== 4. Dynamic segment weights =====
+        # (1) Get per-segment representation (mean pooling)
         clinical_vec = clinical_proj.mean(dim=1)      # (batch, proj_size)
         findings_vec = findings_proj.mean(dim=1)
         comparative_vec = comparative_proj.mean(dim=1)
 
-        # (2) 计算权重
+        # (2) Compute weights
         segment_scores = torch.cat([
             self.segment_gate(clinical_vec),
             self.segment_gate(findings_vec),
@@ -277,15 +501,15 @@ class TokenLevelSegmentedBert(nn.Module):
         w2 = segment_weights[:, 1].unsqueeze(-1).unsqueeze(-1)
         w3 = segment_weights[:, 2].unsqueeze(-1).unsqueeze(-1)
 
-        # (4) 对 token 加权
+        # (4) Weight tokens
         clinical_proj = clinical_proj * w1
         findings_proj = findings_proj * w2
         comparative_proj = comparative_proj * w3
 
-        # ===== 5. 拼接 token =====
+        # ===== 5. Concatenate tokens =====
         x = torch.cat([clinical_proj, findings_proj, comparative_proj], dim=1)
 
-        # ===== 6. 加 Global CLS =====
+        # ===== 6. Add Global CLS =====
         cls_token = self.global_cls.expand(batch_size, -1, -1)
         x = torch.cat([cls_token, x], dim=1)
 
@@ -306,17 +530,14 @@ class TokenLevelSegmentedBert(nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=0)
         attn_pooled = (token_output * attn_weights).sum(dim=0)
 
-        # 融合
+        # Fusion
         final_repr = cls_output + attn_pooled
 
         logits = self.classifier(self.dropout(final_repr))
-        if return_constraint_weight and return_last_layer_attn:
-            return logits, self.get_carcinoma_constraint_w(), last_layer_attn
-        if return_constraint_weight:
-            return logits, self.get_carcinoma_constraint_w()
         if return_last_layer_attn:
             return logits, last_layer_attn
         return logits
+
 
 class SegmentedTextDataset(Dataset):
     """
@@ -359,7 +580,14 @@ class SegmentedTextDataset(Dataset):
         return item
 
 
-def make_segmented_encodings(tokenizer, clinical_texts, findings_texts, comparative_texts, max_length):
+def make_segmented_encodings(
+    tokenizer,
+    clinical_texts,
+    findings_texts,
+    comparative_texts,
+    max_length,
+    zero_empty_masks=False,
+):
     """
     Tokenize pre-segmented reports (from train_split.csv)
     
@@ -369,6 +597,8 @@ def make_segmented_encodings(tokenizer, clinical_texts, findings_texts, comparat
         findings_texts: List of findings texts
         comparative_texts: List of comparative analysis texts
         max_length: Maximum token length for each segment
+        zero_empty_masks: If True, set attention_mask to all-zeros for empty
+            segment texts (so padded CLS/SEP from "" do not contribute).
     
     Returns:
         List of tuples (clinical_enc, findings_enc, comparative_enc)
@@ -410,78 +640,21 @@ def make_segmented_encodings(tokenizer, clinical_texts, findings_texts, comparat
         clinical_enc = {k: v.squeeze(0) for k, v in clinical_enc.items()}
         findings_enc = {k: v.squeeze(0) for k, v in findings_enc.items()}
         comparative_enc = {k: v.squeeze(0) for k, v in comparative_enc.items()}
+
+        if zero_empty_masks:
+            if not cli_text.strip():
+                clinical_enc["attention_mask"] = torch.zeros_like(
+                    clinical_enc["attention_mask"]
+                )
+            if not find_text.strip():
+                findings_enc["attention_mask"] = torch.zeros_like(
+                    findings_enc["attention_mask"]
+                )
+            if not comp_text.strip():
+                comparative_enc["attention_mask"] = torch.zeros_like(
+                    comparative_enc["attention_mask"]
+                )
         
         encodings_list.append((clinical_enc, findings_enc, comparative_enc))
     
     return encodings_list
-
-# data_path = "./train_new.csv"
-# df = pd.read_csv(data_path)
-# print(f"总报告数: {len(df)}\n")
-
-# missing_clinical = 0
-# missing_findings = 0
-# missing_comparative = 0
-# all_missing = 0
-# partial_missing = 0
-# debug_examples = []
-
-# # 存储分段后的数据
-# segmented_data = []
-
-# for idx, row in df.iterrows():
-#     report_id = row['ID']
-#     report_raw = row['report']
-#     target = row['target']
-    
-#     # 调用分段函数（内部会调用clean_text）
-#     sections = split_report_by_sections(report_raw)
-    
-#     miss = []
-#     if not sections['clinical_indication'] or sections['clinical_indication'].strip() == '':
-#         missing_clinical += 1
-#         # save report to file
-#         open(f"missing_clinical_{report_id}.txt", "w").write(report_raw)
-#         miss.append('clinical')
-    
-#     if not sections['findings'] or sections['findings'].strip() == '':
-#         missing_findings += 1
-#         miss.append('findings')
-    
-#     if not sections['comparative_analysis'] or sections['comparative_analysis'].strip() == '':
-#         missing_comparative += 1
-#         miss.append('comparative')
-    
-#     # 记录缺失情况
-#     if len(miss) == 3:
-#         all_missing += 1
-#         if len(debug_examples) < 5:
-#             cleaned = clean_text(report_raw)
-#             debug_examples.append((report_id, report_raw[:100], cleaned[:100], sections))
-#     elif len(miss) > 0:
-#         partial_missing += 1
-    
-#     # 收集分段数据
-#     segmented_data.append({
-#         'ID': report_id,
-#         'target': target,
-#         'clinical_indication': sections['clinical_indication'],
-#         'findings': sections['findings'],
-#         'comparative_analysis': sections['comparative_analysis']
-#     })
-
-# print("="*80)
-# print("分段结果统计")
-# print("="*80)
-# print(f"缺失 clinical_indication 的报告数: {missing_clinical}")
-# print(f"缺失 findings 的报告数: {missing_findings}")
-# print(f"缺失 comparative_analysis 的报告数: {missing_comparative}")
-
-# # 保存分段后的数据到CSV
-# segmented_df = pd.DataFrame(segmented_data)
-# output_path = "./train_split.csv"
-# segmented_df.to_csv(output_path, index=False)
-# print(f"\n已保存分段数据到: {output_path}")
-# print(f"数据形状: {segmented_df.shape}")
-# print(f"\n前5行样本:")
-# print(segmented_df.head())
