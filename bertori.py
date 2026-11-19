@@ -1178,7 +1178,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_interval", type=int, default=1, help="Validate every N epochs")
     
     # Checkpoint options
-    parser.add_argument("--ckpt_dir", type=str, default="/proj/berzbiomedicalimagingkth/users/x_zexch/documents/spr2026/spr2026/google-bert-attention", help="Directory to save checkpoints")
+    parser.add_argument("--ckpt_dir", type=str, default="/proj/berzbiomedicalimagingkth/users/x_zexch/documents/spr2026/results/google-bert-attention", help="Directory to save checkpoints")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume from latest checkpoint")
     parser.add_argument("--no_resume", action="store_false", dest="resume", help="Do not resume from checkpoint; start fresh training")
     parser.add_argument("--train_folds", type=str, default="", help="Specify which folds to train (e.g., '1,2,3' or '1-3'). Empty means train all folds.")

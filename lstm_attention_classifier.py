@@ -29,7 +29,16 @@ TEST_PATH = "./test.csv"
 SUB_PATH = "./submission.csv"
 
 # Device setup
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+try:
+    if torch.cuda.is_available():
+        DEVICE = torch.device("cuda")
+        print("[INFO] CUDA is available, will use GPU for training")
+    else:
+        DEVICE = torch.device("cpu")
+        print("[INFO] CUDA not available, using CPU")
+except:
+    DEVICE = torch.device("cpu")
+    print("[INFO] Error accessing CUDA, using CPU")
 
 
 class TextReportDataset(Dataset):
@@ -151,11 +160,15 @@ class LSTMAttentionClassifier(nn.Module):
 
 def compute_metrics(y_true, y_pred, id2label):
     """Compute and return classification metrics."""
-    f1 = f1_score(y_true, y_pred, average="macro")
-    cm = confusion_matrix(y_true, y_pred)
+    label_ids = list(range(len(id2label)))
+    label_names = [str(id2label[i]) for i in label_ids]
+    f1 = f1_score(y_true, y_pred, average="macro", labels=label_ids, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=label_ids)
     report = classification_report(
         y_true, y_pred,
-        target_names=[str(id2label[i]) for i in range(len(id2label))]
+        labels=label_ids,
+        target_names=label_names,
+        zero_division=0,
     )
     return f1, cm, report
 
@@ -193,6 +206,78 @@ def save_misclassified_samples(y_true, y_pred, X_text, train_ids, id2label, mode
             f.write(str(train_ids[idx] if idx < len(train_ids) else f"sample_{idx}") + "\n")
     print(f"[INFO] Misclassified IDs saved to {id_txt_path}")
     return misclassified_df
+
+
+def infer_fold_from_checkpoint(
+    fold, checkpoint_path, X_val, y_val, val_ids,
+    tokenizer, num_classes, id2label,
+    embedding_dim=100, hidden_size=128, num_layers=2,
+    batch_size=32, max_length=256
+):
+    """Load checkpoint and perform inference on validation set."""
+    print(f"\n[INFO] Loading checkpoint for fold {fold}: {checkpoint_path}")
+    
+    # Try to use CPU for loading to avoid CUDA issues
+    load_device = 'cpu'
+    print(f"[INFO] Loading checkpoint to {load_device}")
+    
+    # Load checkpoint
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=load_device, weights_only=False)
+    except Exception as e:
+        print(f"[WARNING] Error loading with weights_only=False: {e}, retrying...")
+        checkpoint = torch.load(checkpoint_path, map_location=load_device)
+    
+    model_config = checkpoint['model_config']
+    
+    # Recreate model on CPU first
+    model = LSTMAttentionClassifier(
+        vocab_size=model_config['vocab_size'],
+        embedding_dim=model_config['embedding_dim'],
+        hidden_size=model_config['hidden_size'],
+        num_layers=model_config['num_layers'],
+        num_classes=model_config['num_classes'],
+        dropout=0.3
+    ).to(load_device)
+    
+    # Load model weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"[INFO] Model loaded successfully")
+    
+    # Create dataset and loader
+    val_dataset = TextReportDataset(X_val, y_val, tokenizer, max_length)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Inference
+    print(f"[INFO] Performing inference on fold {fold}...")
+    y_pred, y_true, confidences = inference_with_confidence(model, val_loader, load_device)
+    
+    # Compute correctness
+    correct = (y_pred == y_true).astype(int)
+    
+    print(f"[INFO] Inference completed. Accuracy: {np.mean(correct):.4f}")
+    
+    return y_pred, y_true, confidences, correct
+
+
+def save_oof_predictions_csv(y_pred, y_true, confidences, correct, val_ids, id2label, output_path):
+    """Save OOF predictions as CSV."""
+    oof_data = []
+    
+    for i in range(len(val_ids)):
+        oof_data.append({
+            'ID': val_ids[i],
+            'true_label': id2label[y_true[i]],
+            'pred_label': id2label[y_pred[i]],
+            'confidence': confidences[i],
+            'correct': bool(correct[i])
+        })
+    
+    oof_df = pd.DataFrame(oof_data)
+    oof_df.to_csv(output_path, index=False)
+    print(f"[INFO] OOF predictions saved to {output_path}")
+    
+    return oof_df
 
 
 def train_epoch(model, train_loader, criterion, optimizer, device):
@@ -244,6 +329,32 @@ def evaluate(model, val_loader, criterion, device):
     
     val_loss = total_loss / len(val_loader)
     return val_loss, np.array(all_preds), np.array(all_labels)
+
+
+def inference_with_confidence(model, val_loader, device):
+    """Inference on validation set with confidence scores."""
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_confidence = []
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            logits = model(input_ids, attention_mask)
+            
+            # Get predictions and confidence
+            probs = torch.softmax(logits, dim=1)
+            confidence, preds = torch.max(probs, dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_confidence.extend(confidence.cpu().numpy())
+    
+    return np.array(all_preds), np.array(all_labels), np.array(all_confidence)
 
 
 def train_lstm_attention(
@@ -299,8 +410,7 @@ def train_lstm_attention(
         
         scheduler.step(val_f1)
         
-        if (epoch + 1) % 3 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:2d}/{epochs}: train_loss={train_loss:.5f}, val_loss={val_loss:.5f}, val_f1={val_f1:.5f}")
+        print(f"Epoch {epoch+1:2d}/{epochs}: train_loss={train_loss:.5f}, val_loss={val_loss:.5f}, val_f1={val_f1:.5f}")
         
         if val_f1 > best_f1:
             best_f1 = val_f1
@@ -382,126 +492,238 @@ def main(args):
     # Create checkpoint directory
     os.makedirs(args.ckpt_dir, exist_ok=True)
     
-    # Initialize summary file
-    summary_path = os.path.join(args.ckpt_dir, "lstm_attention_summary.txt")
-    with open(summary_path, "w") as f:
-        f.write("=" * 80 + "\n")
-        f.write("LSTM + ATTENTION POOLING CLASSIFIER VALIDATION RESULTS SUMMARY\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(f"Model Configuration:\n")
-        f.write(f"  Tokenizer: {args.tokenizer_name}\n")
-        f.write(f"  Embedding Dim: {args.embedding_dim}\n")
-        f.write(f"  Hidden Size: {args.hidden_size}\n")
-        f.write(f"  LSTM Layers: {args.num_layers}\n")
-        f.write(f"  Batch Size: {args.batch_size}\n")
-        f.write(f"  Epochs: {args.epochs}\n")
-        f.write(f"  Learning Rate: {args.learning_rate}\n")
-        f.write(f"  Max Length: {args.max_length}\n")
-        f.write("=" * 80 + "\n\n")
+    # Check if all checkpoints exist
+    all_checkpoints_exist = True
+    for fold in range(1, args.n_splits + 1):
+        checkpoint_path = os.path.join(args.ckpt_dir, f"fold_{fold}_lstm_attention_model.pt")
+        if not os.path.exists(checkpoint_path):
+            all_checkpoints_exist = False
+            print(f"[WARNING] Checkpoint not found for fold {fold}: {checkpoint_path}")
+            break
     
-    # K-Fold Cross-Validation
-    gkf = GroupKFold(n_splits=args.n_splits, shuffle=True, random_state=RANDOM_STATE)
-    
-    lstm_scores = []
-    lstm_oof_pred = np.empty(len(train), dtype=int)
-    
-    for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_text, y, groups=groups), 1):
-        print(f"\n{'#'*80}")
-        print(f"# FOLD {fold}/{args.n_splits}")
-        print(f"{'#'*80}")
+    # If all checkpoints exist, perform inference; otherwise, train
+    if all_checkpoints_exist:
+        print(f"\n{'='*80}")
+        print("ALL CHECKPOINTS FOUND - PERFORMING INFERENCE")
+        print(f"{'='*80}\n")
         
-        X_tr = X_text[tr_idx]
-        X_va = X_text[va_idx]
-        y_tr = y[tr_idx]
-        y_va = y[va_idx]
+        # K-Fold Cross-Validation for inference
+        gkf = GroupKFold(n_splits=args.n_splits)
         
-        print(f"Train: {len(X_tr)}, Val: {len(X_va)}")
+        lstm_oof_pred = np.empty(len(train), dtype=int)
+        lstm_oof_true = np.empty(len(train), dtype=int)
+        lstm_oof_confidence = np.empty(len(train), dtype=float)
+        lstm_oof_correct = np.empty(len(train), dtype=int)
         
-        # Train LSTM + Attention
-        lstm_model, lstm_f1, lstm_pred, lstm_cm, lstm_report = train_lstm_attention(
-            X_tr, y_tr, X_va, y_va,
-            fold, args.ckpt_dir, id2label,
-            tokenizer, num_labels,
-            embedding_dim=args.embedding_dim,
-            hidden_size=args.hidden_size,
-            num_layers=args.num_layers,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            learning_rate=args.learning_rate,
-            max_length=args.max_length
+        lstm_oof_ids = np.empty(len(train), dtype=object)
+        
+        for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_text, y, groups=groups), 1):
+            print(f"\n{'#'*80}")
+            print(f"# FOLD {fold}/{args.n_splits}")
+            print(f"{'#'*80}")
+            
+            X_va = X_text[va_idx]
+            y_va = y[va_idx]
+            va_ids = train_ids[va_idx]
+            
+            checkpoint_path = os.path.join(args.ckpt_dir, f"fold_{fold}_lstm_attention_model.pt")
+            
+            # Perform inference
+            y_pred, y_true, confidences, correct = infer_fold_from_checkpoint(
+                fold, checkpoint_path, X_va, y_va, va_ids,
+                tokenizer, num_labels, id2label,
+                embedding_dim=args.embedding_dim,
+                hidden_size=args.hidden_size,
+                num_layers=args.num_layers,
+                batch_size=args.batch_size,
+                max_length=args.max_length
+            )
+            
+            lstm_oof_pred[va_idx] = y_pred
+            lstm_oof_true[va_idx] = y_true
+            lstm_oof_confidence[va_idx] = confidences
+            lstm_oof_correct[va_idx] = correct
+            lstm_oof_ids[va_idx] = va_ids
+        
+        # Save OOF predictions as CSV
+        print(f"\n{'='*80}")
+        print("SAVING OOF PREDICTIONS")
+        print(f"{'='*80}\n")
+        
+        oof_csv_path = os.path.join(args.ckpt_dir, "oof_predictions.csv")
+        save_oof_predictions_csv(
+            lstm_oof_pred, lstm_oof_true, lstm_oof_confidence, lstm_oof_correct,
+            lstm_oof_ids, id2label, oof_csv_path
         )
         
-        lstm_scores.append(lstm_f1)
-        lstm_oof_pred[va_idx] = lstm_pred
+        # Compute metrics
+        print(f"\n{'='*80}")
+        print("OOF METRICS")
+        print(f"{'='*80}\n")
         
-        # Append fold results to summary
+        lstm_oof_f1 = f1_score(lstm_oof_true, lstm_oof_pred, average="macro")
+        lstm_oof_accuracy = np.mean(lstm_oof_correct)
+        
+        print(f"LSTM + Attention Pooling (from checkpoints):")
+        print(f"  OOF F1 (macro): {lstm_oof_f1:.5f}")
+        print(f"  OOF Accuracy: {lstm_oof_accuracy:.5f}")
+        
+        # OOF analysis
+        try:
+            label_ids = list(range(num_labels))
+            lstm_cm_oof = confusion_matrix(lstm_oof_true, lstm_oof_pred, labels=label_ids)
+            lstm_report_oof = classification_report(
+                lstm_oof_true, lstm_oof_pred,
+                labels=label_ids,
+                target_names=[str(id2label[i]) for i in label_ids],
+                zero_division=0,
+            )
+            
+            oof_lstm_path = os.path.join(args.ckpt_dir, "oof_analysis_lstm_attention.txt")
+            with open(oof_lstm_path, "w") as f:
+                f.write(f"OOF F1 (macro): {lstm_oof_f1:.5f}\n")
+                f.write(f"OOF Accuracy: {lstm_oof_accuracy:.5f}\n\n")
+                f.write(f"Confusion Matrix:\n{lstm_cm_oof}\n\n")
+                f.write(f"Classification Report:\n{lstm_report_oof}\n")
+            
+            oof_lstm_cm_csv = os.path.join(args.ckpt_dir, "oof_confusion_matrix_lstm_attention.csv")
+            oof_lstm_report_csv = os.path.join(args.ckpt_dir, "oof_classification_report_lstm_attention.csv")
+            save_confusion_matrix_as_table(lstm_cm_oof, id2label, oof_lstm_cm_csv)
+            save_classification_report_as_table(lstm_oof_true, lstm_oof_pred, id2label, oof_lstm_report_csv)
+            
+            print(f"  OOF analysis saved to {oof_lstm_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to compute OOF metrics: {e}")
+        
+        print(f"\n[INFO] Completed inference!")
+    
+    else:
+        print(f"\n{'='*80}")
+        print("CHECKPOINTS NOT FOUND - TRAINING NEW MODELS")
+        print(f"{'='*80}\n")
+        
+        # Initialize summary file
+        summary_path = os.path.join(args.ckpt_dir, "lstm_attention_summary.txt")
+        with open(summary_path, "w") as f:
+            f.write("=" * 80 + "\n")
+            f.write("LSTM + ATTENTION POOLING CLASSIFIER VALIDATION RESULTS SUMMARY\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Model Configuration:\n")
+            f.write(f"  Embedding Dim: {args.embedding_dim}\n")
+            f.write(f"  Hidden Size: {args.hidden_size}\n")
+            f.write(f"  LSTM Layers: {args.num_layers}\n")
+            f.write(f"  Batch Size: {args.batch_size}\n")
+            f.write(f"  Epochs: {args.epochs}\n")
+            f.write(f"  Learning Rate: {args.learning_rate}\n")
+            f.write(f"  Max Length: {args.max_length}\n")
+            f.write("=" * 80 + "\n\n")
+        
+        # K-Fold Cross-Validation
+        gkf = GroupKFold(n_splits=args.n_splits)
+        
+        lstm_scores = []
+        lstm_oof_pred = np.empty(len(train), dtype=int)
+        
+        for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_text, y, groups=groups), 1):
+            print(f"\n{'#'*80}")
+            print(f"# FOLD {fold}/{args.n_splits}")
+            print(f"{'#'*80}")
+            
+            X_tr = X_text[tr_idx]
+            X_va = X_text[va_idx]
+            y_tr = y[tr_idx]
+            y_va = y[va_idx]
+            
+            print(f"Train: {len(X_tr)}, Val: {len(X_va)}")
+            
+            # Train LSTM + Attention
+            lstm_model, lstm_f1, lstm_pred, lstm_cm, lstm_report = train_lstm_attention(
+                X_tr, y_tr, X_va, y_va,
+                fold, args.ckpt_dir, id2label,
+                tokenizer, num_labels,
+                embedding_dim=args.embedding_dim,
+                hidden_size=args.hidden_size,
+                num_layers=args.num_layers,
+                batch_size=args.batch_size,
+                epochs=args.epochs,
+                learning_rate=args.learning_rate,
+                max_length=args.max_length
+            )
+            
+            lstm_scores.append(lstm_f1)
+            lstm_oof_pred[va_idx] = lstm_pred
+            
+            # Append fold results to summary
+            with open(summary_path, "a") as f:
+                f.write(f"Fold {fold} - LSTM + Attention Results:\n")
+                f.write(f"  F1 Score (macro): {lstm_f1:.5f}\n")
+                f.write(f"  Confusion Matrix:\n{str(lstm_cm).replace(chr(10), chr(10)+'    ')}\n")
+                f.write(f"  Classification Report:\n{lstm_report}\n")
+                f.write("-" * 80 + "\n\n")
+        
+        # ===== Cross-Validation Summary =====
+        print(f"\n{'='*80}")
+        print("CROSS-VALIDATION SUMMARY")
+        print(f"{'='*80}\n")
+        
+        lstm_cv_mean = float(np.mean(lstm_scores))
+        lstm_cv_std = float(np.std(lstm_scores))
+        lstm_oof_f1 = f1_score(y, lstm_oof_pred, average="macro")
+        
+        print(f"LSTM + Attention Pooling:")
+        print(f"  CV mean: {lstm_cv_mean:.5f}, CV std: {lstm_cv_std:.5f}")
+        print(f"  OOF F1: {lstm_oof_f1:.5f}")
+        
+        # OOF analysis
+        try:
+            label_ids = list(range(num_labels))
+            lstm_cm_oof = confusion_matrix(y, lstm_oof_pred, labels=label_ids)
+            lstm_report_oof = classification_report(
+                y, lstm_oof_pred,
+                labels=label_ids,
+                target_names=[str(id2label[i]) for i in label_ids],
+                zero_division=0,
+            )
+            
+            oof_lstm_path = os.path.join(args.ckpt_dir, "oof_analysis_lstm_attention.txt")
+            with open(oof_lstm_path, "w") as f:
+                f.write(f"OOF F1 (macro): {lstm_oof_f1:.5f}\n")
+                f.write(f"CV mean: {lstm_cv_mean:.5f}, CV std: {lstm_cv_std:.5f}\n\n")
+                f.write(f"Confusion Matrix:\n{lstm_cm_oof}\n\n")
+                f.write(f"Classification Report:\n{lstm_report_oof}\n")
+            
+            oof_lstm_cm_csv = os.path.join(args.ckpt_dir, "oof_confusion_matrix_lstm_attention.csv")
+            oof_lstm_report_csv = os.path.join(args.ckpt_dir, "oof_classification_report_lstm_attention.csv")
+            save_confusion_matrix_as_table(lstm_cm_oof, id2label, oof_lstm_cm_csv)
+            save_classification_report_as_table(y, lstm_oof_pred, id2label, oof_lstm_report_csv)
+            
+            print(f"  OOF analysis saved to {oof_lstm_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to compute OOF metrics: {e}")
+        
+        # Append CV summary to main summary file
         with open(summary_path, "a") as f:
-            f.write(f"Fold {fold} - LSTM + Attention Results:\n")
-            f.write(f"  F1 Score (macro): {lstm_f1:.5f}\n")
-            f.write(f"  Confusion Matrix:\n{str(lstm_cm).replace(chr(10), chr(10)+'    ')}\n")
-            f.write(f"  Classification Report:\n{lstm_report}\n")
-            f.write("-" * 80 + "\n\n")
-    
-    # ===== Cross-Validation Summary =====
-    print(f"\n{'='*80}")
-    print("CROSS-VALIDATION SUMMARY")
-    print(f"{'='*80}\n")
-    
-    lstm_cv_mean = float(np.mean(lstm_scores))
-    lstm_cv_std = float(np.std(lstm_scores))
-    lstm_oof_f1 = f1_score(y, lstm_oof_pred, average="macro")
-    
-    print(f"LSTM + Attention Pooling:")
-    print(f"  CV mean: {lstm_cv_mean:.5f}, CV std: {lstm_cv_std:.5f}")
-    print(f"  OOF F1: {lstm_oof_f1:.5f}")
-    
-    # OOF analysis
-    try:
-        lstm_cm_oof = confusion_matrix(y, lstm_oof_pred)
-        lstm_report_oof = classification_report(
-            y, lstm_oof_pred,
-            target_names=[str(id2label[i]) for i in range(num_labels)]
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("OVERALL CROSS-VALIDATION SUMMARY\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"LSTM + Attention Pooling:\n")
+            f.write(f"  CV mean F1 (macro): {lstm_cv_mean:.5f}\n")
+            f.write(f"  CV std F1 (macro): {lstm_cv_std:.5f}\n")
+            f.write(f"  OOF F1 (macro): {lstm_oof_f1:.5f}\n")
+        
+        print(f"\n[INFO] Summary saved to {summary_path}")
+        print(f"\n[INFO] All results saved to {args.ckpt_dir}")
+        
+        # ===== Save Misclassified Samples =====
+        print(f"\n{'='*80}")
+        print("SAVING MISCLASSIFIED SAMPLES")
+        print(f"{'='*80}\n")
+        
+        save_misclassified_samples(
+            y, lstm_oof_pred, X_text, train_ids, id2label, "lstm_attention", args.ckpt_dir
         )
         
-        oof_lstm_path = os.path.join(args.ckpt_dir, "oof_analysis_lstm_attention.txt")
-        with open(oof_lstm_path, "w") as f:
-            f.write(f"OOF F1 (macro): {lstm_oof_f1:.5f}\n")
-            f.write(f"CV mean: {lstm_cv_mean:.5f}, CV std: {lstm_cv_std:.5f}\n\n")
-            f.write(f"Confusion Matrix:\n{lstm_cm_oof}\n\n")
-            f.write(f"Classification Report:\n{lstm_report_oof}\n")
-        
-        oof_lstm_cm_csv = os.path.join(args.ckpt_dir, "oof_confusion_matrix_lstm_attention.csv")
-        oof_lstm_report_csv = os.path.join(args.ckpt_dir, "oof_classification_report_lstm_attention.csv")
-        save_confusion_matrix_as_table(lstm_cm_oof, id2label, oof_lstm_cm_csv)
-        save_classification_report_as_table(y, lstm_oof_pred, id2label, oof_lstm_report_csv)
-        
-        print(f"  OOF analysis saved to {oof_lstm_path}")
-    except Exception as e:
-        print(f"[ERROR] Failed to compute OOF metrics: {e}")
-    
-    # Append CV summary to main summary file
-    with open(summary_path, "a") as f:
-        f.write("\n" + "=" * 80 + "\n")
-        f.write("OVERALL CROSS-VALIDATION SUMMARY\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(f"LSTM + Attention Pooling:\n")
-        f.write(f"  CV mean F1 (macro): {lstm_cv_mean:.5f}\n")
-        f.write(f"  CV std F1 (macro): {lstm_cv_std:.5f}\n")
-        f.write(f"  OOF F1 (macro): {lstm_oof_f1:.5f}\n")
-    
-    print(f"\n[INFO] Summary saved to {summary_path}")
-    print(f"\n[INFO] All results saved to {args.ckpt_dir}")
-    
-    # ===== Save Misclassified Samples =====
-    print(f"\n{'='*80}")
-    print("SAVING MISCLASSIFIED SAMPLES")
-    print(f"{'='*80}\n")
-    
-    save_misclassified_samples(
-        y, lstm_oof_pred, X_text, train_ids, id2label, "lstm_attention", args.ckpt_dir
-    )
-    
-    print(f"\n[INFO] Completed!")
+        print(f"\n[INFO] Completed!")
 
 
 if __name__ == "__main__":
@@ -513,8 +735,8 @@ if __name__ == "__main__":
     parser.add_argument("--sub_path", type=str, default=SUB_PATH)
     
     # Tokenizer
-    parser.add_argument("--tokenizer_name", type=str, default="bert-base-uncased")
-    
+    # parser.add_argument("--tokenizer_name", type=str, default="bert-base-uncased")
+    parser.add_argument("--tokenizer_name", type=str, default="pucpr/biobertpt-all")
     # Model hyperparameters
     parser.add_argument("--embedding_dim", type=int, default=100)
     parser.add_argument("--hidden_size", type=int, default=128)
@@ -523,14 +745,14 @@ if __name__ == "__main__":
     
     # Training hyperparameters
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     
     # Cross-validation
     parser.add_argument("--n_splits", type=int, default=N_SPLITS)
     
     # Output
-    parser.add_argument("--ckpt_dir", type=str, default="spr2026/lstm_attention_models")
+    parser.add_argument("--ckpt_dir", type=str, default="results/lstm_attention_models")
     
     args, _ = parser.parse_known_args()
     

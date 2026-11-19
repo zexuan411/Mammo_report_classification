@@ -42,7 +42,6 @@ from bertori import (
     ordinal_loss,
     dual_head_mixed_loss,
     hierarchical_birads_loss,
-    combine_zero_vs_ordinal_logits,
     focal_loss,
 )
 
@@ -299,13 +298,9 @@ class CrossAttentionSegmentedBert(nn.Module):
         # ===== Classifier =====
         dropped = self.dropout(final_repr)
         if self.hierarchical:
-            binary_logits = self.binary_classifier(dropped).squeeze(-1)
-            ordinal_logits = self.ordinal_classifier(dropped)
-            logits = combine_zero_vs_ordinal_logits(binary_logits, ordinal_logits)
             outputs = DualHeadOutput(
-                logits=logits,
-                ordinal_logits=ordinal_logits,
-                binary_logits=binary_logits,
+                ordinal_logits=self.ordinal_classifier(dropped),
+                binary_logits=self.binary_classifier(dropped).squeeze(-1),
             )
         elif self.dual_head:
             outputs = DualHeadOutput(
@@ -396,8 +391,24 @@ def resolve_loss_config(args):
 
 
 def compute_segmented_loss(outputs, labels, class_weights, loss_type, loss_kwargs):
-    ce_logits = extract_ce_logits(outputs)
     label_smoothing = float(loss_kwargs.get("label_smoothing", 0.0) or 0.0)
+
+    if loss_type == "hierarchical":
+        binary_logits = getattr(outputs, "binary_logits", None)
+        ordinal_logits = getattr(outputs, "ordinal_logits", None)
+        if binary_logits is None or ordinal_logits is None:
+            raise ValueError("hierarchical loss requires binary_logits and ordinal_logits on outputs")
+        return hierarchical_birads_loss(
+            binary_logits,
+            ordinal_logits,
+            labels,
+            num_classes=NUM_LABELS,
+            class_weights=class_weights,
+            mix_lambda=float(loss_kwargs.get("mix_lambda", 0.5)),
+            zero_label=int(loss_kwargs.get("hier_zero_label", 0)),
+        )
+
+    ce_logits = extract_ce_logits(outputs)
 
     def _ce(logits):
         return F.cross_entropy(
@@ -438,20 +449,6 @@ def compute_segmented_loss(outputs, labels, class_weights, loss_type, loss_kwarg
             mix_lambda=mix_lambda,
             use_focal=use_focal,
             gamma=loss_kwargs["focal_gamma"],
-        )
-    if loss_type == "hierarchical":
-        binary_logits = getattr(outputs, "binary_logits", None)
-        ordinal_logits = getattr(outputs, "ordinal_logits", None)
-        if binary_logits is None or ordinal_logits is None:
-            raise ValueError("hierarchical loss requires binary_logits and ordinal_logits on outputs")
-        return hierarchical_birads_loss(
-            binary_logits,
-            ordinal_logits,
-            labels,
-            num_classes=ce_logits.size(1),
-            class_weights=class_weights,
-            mix_lambda=float(loss_kwargs.get("mix_lambda", 0.5)),
-            zero_label=int(loss_kwargs.get("hier_zero_label", 0)),
         )
     raise ValueError(f"Unknown loss_type: {loss_type}")
 
@@ -1673,7 +1670,7 @@ if __name__ == "__main__":
     parser.add_argument("--focal_gamma", type=float, default=1.0, help="Focal loss gamma parameter")
 
     # Checkpoint options
-    parser.add_argument("--ckpt_dir", type=str, default="./spr2026/segmented_crossattn_811", help="Directory to save checkpoints")
+    parser.add_argument("--ckpt_dir", type=str, default="./results/segmented_crossattn_811", help="Directory to save checkpoints")
     parser.add_argument("--resume", action="store_true", default=True, help="Resume from latest checkpoint")
 
     # Ablation

@@ -307,7 +307,7 @@ def main(args):
         f.write("=" * 80 + "\n\n")
     
     # K-Fold Cross-Validation
-    gkf = GroupKFold(n_splits=args.n_splits, shuffle=True, random_state=RANDOM_STATE)
+    gkf = GroupKFold(n_splits=args.n_splits)
     
     svc_scores = []
     lgb_scores = []
@@ -501,7 +501,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_splits", type=int, default=N_SPLITS)
     
     # Output
-    parser.add_argument("--ckpt_dir", type=str, default="spr2026/baseline_models")
+    parser.add_argument("--ckpt_dir", type=str, default="results/baseline_models_429")
     
     args, _ = parser.parse_known_args()
     
